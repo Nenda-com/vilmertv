@@ -291,11 +291,14 @@ app.get("/channel.mpd", async (req, res) => {
 
       const dur = getItemDurationSeconds(it);
 
-      const upstreamBase = baseUrlFromMpdUrl(mpdUrl);
-      const b64 = b64urlEncode(upstreamBase);
+const upstreamBase = baseUrlFromMpdUrl(mpdUrl);
 
-      // IMPORTANT: always https (req.protocol may be http behind ingress)
+// Inline base64url to guarantee no "/" ends up in the token
+let b64 = Buffer.from(upstreamBase, "utf8").toString("base64");
+b64 = b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+
 const proxiedBase = `https://${req.get("host")}/p/${b64}/`;
+
       periods.push({
         "@_id": getItemId(it, idx),
         "@_start": `PT${periodStart}S`,
