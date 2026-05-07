@@ -18,9 +18,10 @@ const DEFAULT_ITEM_DURATION_SECONDS = Number(
 const WINDOW_ITEMS = Number(process.env.WINDOW_ITEMS || 5);
 
 // Live tune-in config
-// CHANNEL_START_TIME is required: a fixed ISO8601 UTC anchor for the channel's
-// presentation timeline. Pin it once and never change it — it's the AST.
-const CHANNEL_START_TIME = process.env.CHANNEL_START_TIME;
+// CHANNEL_START_TIME is the fixed AST anchor for the channel's presentation
+// timeline. Pin it once and never change it — changing it resets the timeline.
+const CHANNEL_START_TIME =
+  process.env.CHANNEL_START_TIME || "2026-05-07T10:00:00+02:00";
 const DVR_WINDOW_SECONDS = Number(process.env.DVR_WINDOW_SECONDS || 3600);
 const SUGGESTED_DELAY_SECONDS = Number(
   process.env.SUGGESTED_DELAY_SECONDS || 30
