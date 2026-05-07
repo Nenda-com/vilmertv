@@ -25,6 +25,10 @@ const xmlBuilder = new XMLBuilder({
   ignoreAttributes: false,
   attributeNamePrefix: "@_",
   format: true,
+  // Default is true, which strips values of attributes equal to "true"
+  // (e.g. `segmentAlignment="true"` becomes a bare `segmentAlignment`).
+  // That produces invalid XML for DASH MPDs — keep the explicit value.
+  suppressBooleanAttributes: false,
 });
 
 // --- CORS + Range support (needed for Shaka / browser playback) ---
