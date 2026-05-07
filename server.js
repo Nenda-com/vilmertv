@@ -116,6 +116,12 @@ async function fetchMpdParsed(mpdUrl) {
   return parsed;
 }
 
+function isImageAdaptationSet(as) {
+  const ct = as?.["@_contentType"];
+  const mt = as?.["@_mimeType"];
+  return ct === "image" || (typeof mt === "string" && mt.startsWith("image/"));
+}
+
 function adaptationSetsFromParsed(parsed) {
   const period = Array.isArray(parsed.MPD?.Period)
     ? parsed.MPD.Period[0]
@@ -123,7 +129,9 @@ function adaptationSetsFromParsed(parsed) {
   let as = period?.AdaptationSet;
   if (!as) return null;
   if (!Array.isArray(as)) as = [as];
-  return as;
+  // Drop thumbnail/image tracks — upstream 404s on them and Shaka complains.
+  as = as.filter((a) => !isImageAdaptationSet(a));
+  return as.length ? as : null;
 }
 
 function parseIso8601DurationToSeconds(s) {
