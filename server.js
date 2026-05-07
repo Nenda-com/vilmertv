@@ -92,28 +92,43 @@ function baseUrlFromMpdUrl(mpdUrl) {
 }
 
 /**
- * Ensure a valueless/boolean-ish key becomes a proper XML attribute with a value.
- * Example:
- *   segmentAlignment            -> @_segmentAlignment="true"
- *   @_segmentAlignment=""|true  -> @_segmentAlignment="true"
+ * Sanitize boolean-ish DASH attributes so the produced XML is valid.
+ *
+ * Problem: some MPDs contain valueless boolean attributes like:
+ *   <AdaptationSet ... segmentAlignment startWithSAP="1">
+ * That is NOT valid XML (must be segmentAlignment="true").
+ *
+ * This function:
+ * - converts bare keys (segmentAlignment: true/"") to attributes (@_segmentAlignment="true")
+ * - converts valueless attributes (@_foo: ""|true|null) to "true"
+ * - walks the entire object tree (so we don't miss where it appears)
  */
-function forceXmlAttrTrue(obj, key) {
-  if (!obj || typeof obj !== "object") return;
+function sanitizeDashXmlBooleans(node) {
+  if (!node || typeof node !== "object") return;
 
-  // If it exists as a bare key (segmentAlignment) -> move to attribute form
-  if (obj[key] === "" || obj[key] === true || obj[key] === null) {
-    obj[`@_${key}`] = "true";
-    delete obj[key];
-  }
+  const booleanAttrs = new Set([
+    "segmentAlignment",
+    "subsegmentAlignment",
+    "bitstreamSwitching",
+  ]);
 
-  // If it exists as an attribute but is valueless -> set value
-  const attrKey = `@_${key}`;
-  if (obj[attrKey] === "" || obj[attrKey] === true || obj[attrKey] === null) {
-    obj[attrKey] = "true";
-  }
+  for (const k of Object.keys(node)) {
+    const v = node[k];
 
-  for (const v of Object.values(obj)) {
-    if (typeof v === "object") forceXmlAttrTrue(v, key);
+    // Bare key -> attribute with value
+    if (booleanAttrs.has(k) && (v === "" || v === true || v === null)) {
+      node[`@_${k}`] = "true";
+      delete node[k];
+      continue;
+    }
+
+    // Attribute key but valueless -> set value
+    if (k.startsWith("@_") && (v === "" || v === true || v === null)) {
+      node[k] = "true";
+      continue;
+    }
+
+    if (typeof v === "object") sanitizeDashXmlBooleans(v);
   }
 }
 
@@ -173,13 +188,6 @@ app.get("/channel.mpd", async (_req, res) => {
     // Normalize AdaptationSet to array
     if (!Array.isArray(adaptationSets)) adaptationSets = [adaptationSets];
 
-    // Fix invalid XML boolean attrs like segmentAlignment (must have a value in XML)
-    for (const as of adaptationSets) {
-      forceXmlAttrTrue(as, "segmentAlignment");
-      forceXmlAttrTrue(as, "subsegmentAlignment");
-      forceXmlAttrTrue(as, "bitstreamSwitching");
-    }
-
     // 4) Build stitched MPD
     const outMpd = deepClone(templateMpd);
 
@@ -221,6 +229,9 @@ app.get("/channel.mpd", async (_req, res) => {
 
     // IMPORTANT: replace Period completely with our stitched periods
     outMpd.MPD.Period = periods;
+
+    // FINAL SANITIZE STEP: ensure output XML is valid
+    sanitizeDashXmlBooleans(outMpd);
 
     const xml = xmlBuilder.build(outMpd);
 
