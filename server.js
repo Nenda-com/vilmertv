@@ -20,7 +20,7 @@ const WINDOW_ITEMS = Number(process.env.WINDOW_ITEMS || 5);
 // Live tune-in config
 const DVR_WINDOW_SECONDS = Number(process.env.DVR_WINDOW_SECONDS || 3600);
 const LIVE_EDGE_MARGIN_SECONDS = Number(
-  process.env.LIVE_EDGE_MARGIN_SECONDS || 30
+  process.env.LIVE_EDGE_MARGIN_SECONDS || 90
 );
 
 const xmlParser = new XMLParser({
