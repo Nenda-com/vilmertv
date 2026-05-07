@@ -136,13 +136,11 @@ function b64urlEncode(str) {
     .replace(/\//g, "_")
     .replace(/=+$/g, "");
 }
-
 function b64urlDecode(str) {
   let s = str.replace(/-/g, "+").replace(/_/g, "/");
   while (s.length % 4) s += "=";
   return Buffer.from(s, "base64").toString("utf8");
 }
-
 /**
  * GET /p/:b64/<path>
  * - :b64 is base64url(upstreamBaseUrl) (must end with "/")
