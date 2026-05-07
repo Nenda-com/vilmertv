@@ -97,6 +97,35 @@ function baseUrlFromMpdUrl(mpdUrl) {
   return u.toString();
 }
 
+// Cache parsed upstream MPDs so /channel.mpd doesn't refetch every request.
+const MPD_CACHE_TTL_MS = 10_000;
+const mpdCache = new Map(); // mpdUrl -> { parsed, fetchedAt }
+
+async function fetchMpdParsed(mpdUrl) {
+  const now = Date.now();
+  const cached = mpdCache.get(mpdUrl);
+  if (cached && now - cached.fetchedAt < MPD_CACHE_TTL_MS) return cached.parsed;
+  const resp = await fetch(mpdUrl);
+  if (!resp.ok) {
+    throw new Error(`Failed to fetch upstream MPD ${mpdUrl}: ${resp.status}`);
+  }
+  const text = await resp.text();
+  const parsedRaw = xmlParser.parse(text);
+  const parsed = parsedRaw?.MPD ? parsedRaw : { MPD: parsedRaw };
+  mpdCache.set(mpdUrl, { parsed, fetchedAt: now });
+  return parsed;
+}
+
+function adaptationSetsFromParsed(parsed) {
+  const period = Array.isArray(parsed.MPD?.Period)
+    ? parsed.MPD.Period[0]
+    : parsed.MPD?.Period;
+  let as = period?.AdaptationSet;
+  if (!as) return null;
+  if (!Array.isArray(as)) as = [as];
+  return as;
+}
+
 function sanitizeDashXmlBooleans(node) {
   if (!node || typeof node !== "object") return;
 
@@ -222,68 +251,18 @@ app.get("/channel.mpd", async (req, res) => {
       return res.status(425).send("Channel has not started yet");
     }
 
-    // 2) Locate the item that contains "now" inside the current loop pass.
-    //    We use this item's MPD as the template (all VODs share the same shape).
-    const currentLoopOffsetSec = nowSec % loopDurationSec;
-    let currentItemIdx = 0;
-    {
-      let acc = 0;
-      for (let i = 0; i < items.length; i++) {
-        if (acc + durationsSec[i] > currentLoopOffsetSec) {
-          currentItemIdx = i;
-          break;
-        }
-        acc += durationsSec[i];
-      }
-    }
-
-    // 3) Fetch a template MPD (we reuse its AdaptationSets/Representations)
-    const templateUrl =
-      getItemUrl(items[currentItemIdx]) || getItemUrl(items[0]);
-    if (!templateUrl) {
-      return res.status(400).send("Playlist item missing MPD url (asset.url)");
-    }
-
-    const templateText = await (await fetch(templateUrl)).text();
-    const parsed = xmlParser.parse(templateText);
-
-    const templateMpd = parsed?.MPD ? parsed : { MPD: parsed };
-
-    const templatePeriod = Array.isArray(templateMpd.MPD?.Period)
-      ? templateMpd.MPD.Period[0]
-      : templateMpd.MPD?.Period;
-
-    let adaptationSets = templatePeriod?.AdaptationSet;
-    if (!adaptationSets) {
-      return res.status(500).send("Template MPD missing Period/AdaptationSet");
-    }
-    if (!Array.isArray(adaptationSets)) adaptationSets = [adaptationSets];
-
-    // 4) Build stitched MPD with a stable AST anchored at CHANNEL_START_TIME.
-    //    Periods carry absolute @start offsets from AST and slide forward as
-    //    wall-clock advances, so the player's monotonic presentation clock
-    //    always falls inside a published Period.
-    const outMpd = deepClone(templateMpd);
-
-    outMpd.MPD["@_type"] = "dynamic";
-    outMpd.MPD["@_availabilityStartTime"] = new Date(
-      channelStartMs
-    ).toISOString();
-    outMpd.MPD["@_minimumUpdatePeriod"] = "PT5S";
-    outMpd.MPD["@_timeShiftBufferDepth"] = `PT${DVR_WINDOW_SECONDS}S`;
-    outMpd.MPD["@_suggestedPresentationDelay"] = `PT${SUGGESTED_DELAY_SECONDS}S`;
-
-    delete outMpd.MPD["@_mediaPresentationDuration"];
-
+    // 2) Walk the loop and collect period specs that overlap the DVR window
+    //    plus up to WINDOW_ITEMS upcoming items. AdaptationSets are resolved
+    //    per-asset below — reusing one template's SegmentTimeline across
+    //    different assets causes 404s because segment numbering differs.
     const windowStartAbs = Math.max(0, nowSec - DVR_WINDOW_SECONDS);
     const futureItemsLimit = Math.max(1, WINDOW_ITEMS);
 
-    // Skip directly to the loop iteration containing windowStartAbs.
     let iteration = Math.floor(windowStartAbs / loopDurationSec);
     let absStart = iteration * loopDurationSec;
     let futureItemsCount = 0;
 
-    const periods = [];
+    const specs = []; // { id, absStart, dur, mpdUrl }
     const MAX_PASSES = 10000; // safety cap
 
     walk: for (let pass = 0; pass < MAX_PASSES; pass++) {
@@ -304,22 +283,60 @@ app.get("/channel.mpd", async (req, res) => {
         const it = items[i];
         const mpdUrl = getItemUrl(it);
         if (mpdUrl) {
-          const upstreamBase = baseUrlFromMpdUrl(mpdUrl);
-          const token = Buffer.from(upstreamBase, "utf8").toString("base64url");
-          const proxiedBase = `https://${req.get("host")}/p/${token}/`;
-
-          periods.push({
-            "@_id": `${getItemId(it, i)}-${iteration}`,
-            "@_start": `PT${absStart}S`,
-            "@_duration": `PT${dur}S`,
-            BaseURL: proxiedBase,
-            AdaptationSet: adaptationSets,
+          specs.push({
+            id: `${getItemId(it, i)}-${iteration}`,
+            absStart,
+            dur,
+            mpdUrl,
           });
         }
-
         absStart = absEnd;
       }
       iteration++;
+    }
+
+    if (!specs.length) {
+      return res.status(500).send("No periods to publish");
+    }
+
+    // 3) Fetch every distinct upstream MPD in parallel (via 10s cache).
+    const uniqueUrls = [...new Set(specs.map((s) => s.mpdUrl))];
+    const fetched = await Promise.all(
+      uniqueUrls.map(async (u) => [u, await fetchMpdParsed(u)])
+    );
+    const mpdByUrl = new Map(fetched);
+
+    // 4) Build stitched MPD with stable AST anchored at CHANNEL_START_TIME.
+    //    Use the first item's parsed MPD as the shell (gives us root attrs).
+    const outMpd = deepClone(mpdByUrl.get(specs[0].mpdUrl));
+
+    outMpd.MPD["@_type"] = "dynamic";
+    outMpd.MPD["@_availabilityStartTime"] = new Date(
+      channelStartMs
+    ).toISOString();
+    outMpd.MPD["@_minimumUpdatePeriod"] = "PT5S";
+    outMpd.MPD["@_timeShiftBufferDepth"] = `PT${DVR_WINDOW_SECONDS}S`;
+    outMpd.MPD["@_suggestedPresentationDelay"] = `PT${SUGGESTED_DELAY_SECONDS}S`;
+
+    delete outMpd.MPD["@_mediaPresentationDuration"];
+
+    const periods = [];
+    for (const spec of specs) {
+      const itemMpd = mpdByUrl.get(spec.mpdUrl);
+      const itemAdaptationSets = adaptationSetsFromParsed(itemMpd);
+      if (!itemAdaptationSets) continue;
+
+      const upstreamBase = baseUrlFromMpdUrl(spec.mpdUrl);
+      const token = Buffer.from(upstreamBase, "utf8").toString("base64url");
+      const proxiedBase = `https://${req.get("host")}/p/${token}/`;
+
+      periods.push({
+        "@_id": spec.id,
+        "@_start": `PT${spec.absStart}S`,
+        "@_duration": `PT${spec.dur}S`,
+        BaseURL: proxiedBase,
+        AdaptationSet: deepClone(itemAdaptationSets),
+      });
     }
 
     outMpd.MPD.Period = periods;
