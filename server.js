@@ -121,15 +121,13 @@ function sanitizeDashXmlBooleans(node) {
 /**
  * GET /p/:token/<path>
  *
- * :token is URL-encoded base64(upstreamBaseUrl). We use encodeURIComponent()
- * so "/" becomes "%2F" and does not break the route.
- *
+ * :token is base64url(upstreamBaseUrl) — URL-path-safe alphabet, no encoding needed.
  * <path> is appended by the DASH client (e.g. video_x/init.cmfv)
  */
 app.get("/p/:token/*", async (req, res) => {
   try {
-    const token = decodeURIComponent(req.params.token); // base64 string
-    const upstreamBase = Buffer.from(token, "base64").toString("utf8");
+    const token = req.params.token; // base64url string (no / + =)
+    const upstreamBase = Buffer.from(token, "base64url").toString("utf8");
 
     if (!/^https?:\/\//i.test(upstreamBase)) {
       return res.status(400).send("Invalid upstream base");
@@ -267,10 +265,8 @@ app.get("/channel.mpd", async (req, res) => {
 
       const upstreamBase = baseUrlFromMpdUrl(mpdUrl);
 
-      // token is URL-encoded base64(upstreamBase)
-      const token = encodeURIComponent(
-        Buffer.from(upstreamBase, "utf8").toString("base64")
-      );
+      // base64url is URL-path-safe (no /, +, or =) so we can drop encodeURIComponent
+      const token = Buffer.from(upstreamBase, "utf8").toString("base64url");
 
       // IMPORTANT: always https (req.protocol may be http behind ingress)
       const proxiedBase = `https://${req.get("host")}/p/${token}/`;
