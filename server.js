@@ -297,8 +297,7 @@ app.get("/channel.mpd", async (req, res) => {
       const b64 = b64urlEncode(upstreamBase);
 
       // IMPORTANT: always https (req.protocol may be http behind ingress)
-      const proxiedBase = `https://${req.get("host")}/p/${b64}/`;
-
+const proxiedBase = `https://${req.get("host")}/p/${b64}/`;
       periods.push({
         "@_id": getItemId(it, idx),
         "@_start": `PT${periodStart}S`,
