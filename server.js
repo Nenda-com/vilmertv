@@ -18,10 +18,10 @@ const DEFAULT_ITEM_DURATION_SECONDS = Number(
 const WINDOW_ITEMS = Number(process.env.WINDOW_ITEMS || 5);
 
 // Live tune-in config
+// CHANNEL_START_TIME is required: a fixed ISO8601 UTC anchor for the channel's
+// presentation timeline. Pin it once and never change it — it's the AST.
+const CHANNEL_START_TIME = process.env.CHANNEL_START_TIME;
 const DVR_WINDOW_SECONDS = Number(process.env.DVR_WINDOW_SECONDS || 3600);
-const LIVE_EDGE_MARGIN_SECONDS = Number(
-  process.env.LIVE_EDGE_MARGIN_SECONDS || 90
-);
 const SUGGESTED_DELAY_SECONDS = Number(
   process.env.SUGGESTED_DELAY_SECONDS || 30
 );
@@ -188,6 +188,16 @@ app.get("/p/:token/*", async (req, res) => {
 });
 app.get("/channel.mpd", async (req, res) => {
   try {
+    if (!CHANNEL_START_TIME) {
+      return res.status(500).send("Missing env CHANNEL_START_TIME");
+    }
+    const channelStartMs = Date.parse(CHANNEL_START_TIME);
+    if (Number.isNaN(channelStartMs)) {
+      return res
+        .status(500)
+        .send("Invalid env CHANNEL_START_TIME (must be ISO8601)");
+    }
+
     // 1) Load playlist
     const playlistResp = await fetch(PLAYLIST_URL, { redirect: "follow" });
     if (!playlistResp.ok) {
@@ -200,25 +210,35 @@ app.get("/channel.mpd", async (req, res) => {
 
     if (!items.length) return res.status(400).send("Playlist has no items");
 
-    // 2) Determine schedule rotation point (loop forever)
     const durationsSec = items.map(getItemDurationSeconds);
-    const totalMs = durationsSec.reduce((a, b) => a + b, 0) * 1000;
-    const now = Date.now();
-    const offsetMs = totalMs > 0 ? now % totalMs : 0;
+    const loopDurationSec = durationsSec.reduce((a, b) => a + b, 0);
+    if (loopDurationSec <= 0) {
+      return res.status(400).send("Playlist has zero total duration");
+    }
 
-    let acc = 0;
-    let startIdx = 0;
-    for (let i = 0; i < durationsSec.length; i++) {
-      const dMs = durationsSec[i] * 1000;
-      if (acc + dMs > offsetMs) {
-        startIdx = i;
-        break;
+    const nowSec = (Date.now() - channelStartMs) / 1000;
+    if (nowSec < 0) {
+      return res.status(425).send("Channel has not started yet");
+    }
+
+    // 2) Locate the item that contains "now" inside the current loop pass.
+    //    We use this item's MPD as the template (all VODs share the same shape).
+    const currentLoopOffsetSec = nowSec % loopDurationSec;
+    let currentItemIdx = 0;
+    {
+      let acc = 0;
+      for (let i = 0; i < items.length; i++) {
+        if (acc + durationsSec[i] > currentLoopOffsetSec) {
+          currentItemIdx = i;
+          break;
+        }
+        acc += durationsSec[i];
       }
-      acc += dMs;
     }
 
     // 3) Fetch a template MPD (we reuse its AdaptationSets/Representations)
-    const templateUrl = getItemUrl(items[startIdx]) || getItemUrl(items[0]);
+    const templateUrl =
+      getItemUrl(items[currentItemIdx]) || getItemUrl(items[0]);
     if (!templateUrl) {
       return res.status(400).send("Playlist item missing MPD url (asset.url)");
     }
@@ -226,10 +246,8 @@ app.get("/channel.mpd", async (req, res) => {
     const templateText = await (await fetch(templateUrl)).text();
     const parsed = xmlParser.parse(templateText);
 
-    // MPD root may be parsed as { MPD: {...} }
     const templateMpd = parsed?.MPD ? parsed : { MPD: parsed };
 
-    // Find AdaptationSet structure from the template
     const templatePeriod = Array.isArray(templateMpd.MPD?.Period)
       ? templateMpd.MPD.Period[0]
       : templateMpd.MPD?.Period;
@@ -240,65 +258,67 @@ app.get("/channel.mpd", async (req, res) => {
     }
     if (!Array.isArray(adaptationSets)) adaptationSets = [adaptationSets];
 
-    // 4) Build stitched MPD
+    // 4) Build stitched MPD with a stable AST anchored at CHANNEL_START_TIME.
+    //    Periods carry absolute @start offsets from AST and slide forward as
+    //    wall-clock advances, so the player's monotonic presentation clock
+    //    always falls inside a published Period.
     const outMpd = deepClone(templateMpd);
 
-    const count = Math.min(WINDOW_ITEMS, items.length);
-    let windowDurationSec = 0;
-    for (let k = 0; k < count; k++) {
-      const idx = (startIdx + k) % items.length;
-      windowDurationSec += getItemDurationSeconds(items[idx]);
-    }
-
-    // Land Shaka's target time a margin before the end of the published window,
-    // so segments definitely exist at the computed live edge.
-    const liveEdgeOffsetSec = Math.max(
-      0,
-      windowDurationSec - LIVE_EDGE_MARGIN_SECONDS
-    );
-    const availabilityStartTime = new Date(
-      Date.now() - liveEdgeOffsetSec * 1000
-    ).toISOString();
-
     outMpd.MPD["@_type"] = "dynamic";
-    outMpd.MPD["@_availabilityStartTime"] = availabilityStartTime;
+    outMpd.MPD["@_availabilityStartTime"] = new Date(
+      channelStartMs
+    ).toISOString();
     outMpd.MPD["@_minimumUpdatePeriod"] = "PT5S";
-    outMpd.MPD["@_timeShiftBufferDepth"] = `PT${Math.min(
-      DVR_WINDOW_SECONDS,
-      windowDurationSec
-    )}S`;
+    outMpd.MPD["@_timeShiftBufferDepth"] = `PT${DVR_WINDOW_SECONDS}S`;
     outMpd.MPD["@_suggestedPresentationDelay"] = `PT${SUGGESTED_DELAY_SECONDS}S`;
 
     delete outMpd.MPD["@_mediaPresentationDuration"];
 
+    const windowStartAbs = Math.max(0, nowSec - DVR_WINDOW_SECONDS);
+    const futureItemsLimit = Math.max(1, WINDOW_ITEMS);
+
+    // Skip directly to the loop iteration containing windowStartAbs.
+    let iteration = Math.floor(windowStartAbs / loopDurationSec);
+    let absStart = iteration * loopDurationSec;
+    let futureItemsCount = 0;
+
     const periods = [];
-    let periodStart = 0;
+    const MAX_PASSES = 10000; // safety cap
 
-    for (let k = 0; k < count; k++) {
-      const idx = (startIdx + k) % items.length;
-      const it = items[idx];
-      const mpdUrl = getItemUrl(it);
-      if (!mpdUrl) continue;
+    walk: for (let pass = 0; pass < MAX_PASSES; pass++) {
+      for (let i = 0; i < items.length; i++) {
+        const dur = durationsSec[i];
+        const absEnd = absStart + dur;
 
-      const dur = getItemDurationSeconds(it);
+        if (absEnd <= windowStartAbs) {
+          absStart = absEnd;
+          continue;
+        }
 
-      const upstreamBase = baseUrlFromMpdUrl(mpdUrl);
+        if (absStart >= nowSec) {
+          if (futureItemsCount >= futureItemsLimit) break walk;
+          futureItemsCount++;
+        }
 
-      // base64url is URL-path-safe (no /, +, or =) so we can drop encodeURIComponent
-      const token = Buffer.from(upstreamBase, "utf8").toString("base64url");
+        const it = items[i];
+        const mpdUrl = getItemUrl(it);
+        if (mpdUrl) {
+          const upstreamBase = baseUrlFromMpdUrl(mpdUrl);
+          const token = Buffer.from(upstreamBase, "utf8").toString("base64url");
+          const proxiedBase = `https://${req.get("host")}/p/${token}/`;
 
-      // IMPORTANT: always https (req.protocol may be http behind ingress)
-      const proxiedBase = `https://${req.get("host")}/p/${token}/`;
+          periods.push({
+            "@_id": `${getItemId(it, i)}-${iteration}`,
+            "@_start": `PT${absStart}S`,
+            "@_duration": `PT${dur}S`,
+            BaseURL: proxiedBase,
+            AdaptationSet: adaptationSets,
+          });
+        }
 
-      periods.push({
-        "@_id": getItemId(it, idx),
-        "@_start": `PT${periodStart}S`,
-        "@_duration": `PT${dur}S`,
-        BaseURL: proxiedBase,
-        AdaptationSet: adaptationSets,
-      });
-
-      periodStart += dur;
+        absStart = absEnd;
+      }
+      iteration++;
     }
 
     outMpd.MPD.Period = periods;
@@ -319,7 +339,7 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`PLAYLIST_URL=${PLAYLIST_URL}`);
   console.log(`WINDOW_ITEMS=${WINDOW_ITEMS}`);
   console.log(`DEFAULT_ITEM_DURATION_SECONDS=${DEFAULT_ITEM_DURATION_SECONDS}`);
+  console.log(`CHANNEL_START_TIME=${CHANNEL_START_TIME}`);
   console.log(`DVR_WINDOW_SECONDS=${DVR_WINDOW_SECONDS}`);
-  console.log(`LIVE_EDGE_MARGIN_SECONDS=${LIVE_EDGE_MARGIN_SECONDS}`);
   console.log(`SUGGESTED_DELAY_SECONDS=${SUGGESTED_DELAY_SECONDS}`);
 });
