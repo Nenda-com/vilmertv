@@ -208,6 +208,62 @@ function parseIso8601DurationToSeconds(s) {
   return Number.isFinite(total) && total > 0 ? total : null;
 }
 
+// Return a deep-cloned AdaptationSet whose SegmentTimeline is truncated so it
+// covers at most `maxSeconds` of period-relative time. Shaka treats the upstream
+// SegmentTimeline as authoritative for live-edge calculation, so trimming only
+// Period@duration isn't enough — the SegmentTimeline must be trimmed too,
+// otherwise the player picks the original clip end as live edge and parks the
+// playhead in the (still-non-existent) future.
+function trimAdaptationSetTimeline(as, maxSeconds) {
+  const cloned = deepClone(as);
+  const st = cloned?.SegmentTemplate;
+  if (!st) return cloned;
+  const ts = parseInt(st["@_timescale"] || "1", 10);
+  if (!Number.isFinite(ts) || ts <= 0) return cloned;
+  const tl = st.SegmentTimeline;
+  if (!tl) return cloned;
+  let sList = tl.S;
+  if (!sList) return cloned;
+  if (!Array.isArray(sList)) sList = [sList];
+
+  const maxTicks = Math.floor(maxSeconds * ts);
+  if (maxTicks <= 0) {
+    st.SegmentTimeline.S = [];
+    return cloned;
+  }
+
+  let runningT = 0;
+  const newS = [];
+  for (const s of sList) {
+    const tAttr = s?.["@_t"];
+    const t = tAttr !== undefined ? parseInt(tAttr, 10) : runningT;
+    const d = parseInt(s?.["@_d"], 10);
+    const r = parseInt(s?.["@_r"] || "0", 10);
+    if (!Number.isFinite(d) || d <= 0) continue;
+    const count = Number.isFinite(r) && r >= 0 ? r + 1 : 1;
+    const fullEnd = t + d * count;
+
+    if (t >= maxTicks) break;
+
+    if (fullEnd <= maxTicks) {
+      newS.push(s);
+      runningT = fullEnd;
+    } else {
+      const keepCount = Math.floor((maxTicks - t) / d);
+      if (keepCount > 0) {
+        const partial = { ...s };
+        if (keepCount === 1) delete partial["@_r"];
+        else partial["@_r"] = String(keepCount - 1);
+        newS.push(partial);
+        runningT = t + d * keepCount;
+      }
+      break;
+    }
+  }
+  st.SegmentTimeline.S = newS;
+  return cloned;
+}
+
 function adaptationSetTotalSeconds(as) {
   const st = as?.SegmentTemplate;
   if (!st) return null;
@@ -506,10 +562,10 @@ app.get("/channel.mpd", async (req, res) => {
       // per period — which is what we need for VODs from different encoder
       // sessions with slightly different SPS/PPS.
       const adaptationSetsForPeriod = itemAdaptationSets.map((as) => {
-        const cloned = deepClone(as);
-        const stableId = getStableAsId(cloned);
-        cloned["@_id"] = String(stableId);
-        return cloned;
+        const trimmed = trimAdaptationSetTimeline(as, spec.dur);
+        const stableId = getStableAsId(trimmed);
+        trimmed["@_id"] = String(stableId);
+        return trimmed;
       });
 
       periods.push({
