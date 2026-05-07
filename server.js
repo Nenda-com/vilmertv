@@ -14,8 +14,11 @@ const DEFAULT_ITEM_DURATION_SECONDS = Number(
   process.env.DEFAULT_ITEM_DURATION_SECONDS || 1800
 );
 
-// How many upcoming VODs to expose as Periods in the MPD at any time
-const WINDOW_ITEMS = Number(process.env.WINDOW_ITEMS || 5);
+// How many seconds of future content to expose as Periods in the MPD at any
+// time. Item count is a bad cap because a single 5h VOD blows the lookahead
+// way past wall-clock, letting the player jump to a future live edge that
+// doesn't exist yet.
+const LOOKAHEAD_SECONDS = Number(process.env.LOOKAHEAD_SECONDS || 120);
 
 // Live tune-in config
 // CHANNEL_START_TIME is the fixed AST anchor for the channel's presentation
@@ -377,11 +380,15 @@ app.get("/channel.mpd", async (req, res) => {
     // 3) Walk the loop and collect period specs overlapping the DVR window
     //    plus up to WINDOW_ITEMS upcoming items.
     const windowStartAbs = Math.max(0, nowSec - DVR_WINDOW_SECONDS);
-    const futureItemsLimit = Math.max(1, WINDOW_ITEMS);
+    // Stop emitting once the next period would START past now + lookahead.
+    // We always emit at least one period whose @start >= nowSec so the player
+    // has something to chain into, even if a single item is longer than the
+    // lookahead window.
+    const lookaheadEndAbs = nowSec + LOOKAHEAD_SECONDS;
 
     let iteration = Math.floor(windowStartAbs / loopDurationSec);
     let absStart = iteration * loopDurationSec;
-    let futureItemsCount = 0;
+    let emittedFuturePeriod = false;
 
     const specs = []; // { id, absStart, dur, mpdUrl }
     const MAX_PASSES = 10000;
@@ -396,10 +403,8 @@ app.get("/channel.mpd", async (req, res) => {
           continue;
         }
 
-        if (absStart >= nowSec) {
-          if (futureItemsCount >= futureItemsLimit) break walk;
-          futureItemsCount++;
-        }
+        if (absStart >= lookaheadEndAbs && emittedFuturePeriod) break walk;
+        if (absStart >= nowSec) emittedFuturePeriod = true;
 
         const it = items[i];
         const mpdUrl = getItemUrl(it);
@@ -504,7 +509,7 @@ app.get("/channel.mpd", async (req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`vilmertv listening on 0.0.0.0:${PORT}`);
   console.log(`PLAYLIST_URL=${PLAYLIST_URL}`);
-  console.log(`WINDOW_ITEMS=${WINDOW_ITEMS}`);
+  console.log(`LOOKAHEAD_SECONDS=${LOOKAHEAD_SECONDS}`);
   console.log(`DEFAULT_ITEM_DURATION_SECONDS=${DEFAULT_ITEM_DURATION_SECONDS}`);
   console.log(`CHANNEL_START_TIME=${CHANNEL_START_TIME}`);
   console.log(`DVR_WINDOW_SECONDS=${DVR_WINDOW_SECONDS}`);
