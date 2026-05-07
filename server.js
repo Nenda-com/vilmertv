@@ -379,9 +379,14 @@ app.get("/channel.mpd", async (req, res) => {
       }
       return id;
     };
-    const addPeriodContinuity = (as, stableId) => {
+    // period-connectivity:2018 (not -continuity:2015) — same logical stream
+    // across periods, but the player MUST refetch init segments at the
+    // boundary because each VOD comes from a different encoder run with
+    // slightly different SPS/PPS. Continuity-2015 would tell Shaka to reuse
+    // the prior init, which silently breaks decoding (fade to black).
+    const addPeriodConnectivity = (as, stableId) => {
       const prop = {
-        "@_schemeIdUri": "urn:mpeg:dash:period-continuity:2015",
+        "@_schemeIdUri": "urn:mpeg:dash:period-connectivity:2018",
         "@_value": String(stableId),
       };
       const existing = as.SupplementalProperty;
@@ -405,7 +410,7 @@ app.get("/channel.mpd", async (req, res) => {
         const cloned = deepClone(as);
         const stableId = getStableAsId(cloned);
         cloned["@_id"] = String(stableId);
-        addPeriodContinuity(cloned, stableId);
+        addPeriodConnectivity(cloned, stableId);
         return cloned;
       });
 
