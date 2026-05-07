@@ -19,6 +19,9 @@ const WINDOW_ITEMS = Number(process.env.WINDOW_ITEMS || 5);
 
 // Live tune-in config
 const DVR_WINDOW_SECONDS = Number(process.env.DVR_WINDOW_SECONDS || 3600);
+const LIVE_EDGE_MARGIN_SECONDS = Number(
+  process.env.LIVE_EDGE_MARGIN_SECONDS || 30
+);
 
 const xmlParser = new XMLParser({
   ignoreAttributes: false,
@@ -244,10 +247,14 @@ app.get("/channel.mpd", async (req, res) => {
       windowDurationSec += getItemDurationSeconds(items[idx]);
     }
 
-    // Make "now" align with the end of the published window so Shaka tunes in
-    // at the live edge: live edge = now - availabilityStartTime.
+    // Land Shaka's target time a margin before the end of the published window,
+    // so segments definitely exist at the computed live edge.
+    const liveEdgeOffsetSec = Math.max(
+      0,
+      windowDurationSec - LIVE_EDGE_MARGIN_SECONDS
+    );
     const availabilityStartTime = new Date(
-      Date.now() - windowDurationSec * 1000
+      Date.now() - liveEdgeOffsetSec * 1000
     ).toISOString();
 
     outMpd.MPD["@_type"] = "dynamic";
@@ -310,4 +317,5 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`WINDOW_ITEMS=${WINDOW_ITEMS}`);
   console.log(`DEFAULT_ITEM_DURATION_SECONDS=${DEFAULT_ITEM_DURATION_SECONDS}`);
   console.log(`DVR_WINDOW_SECONDS=${DVR_WINDOW_SECONDS}`);
+  console.log(`LIVE_EDGE_MARGIN_SECONDS=${LIVE_EDGE_MARGIN_SECONDS}`);
 });
