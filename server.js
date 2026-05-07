@@ -5,7 +5,7 @@ import { XMLParser, XMLBuilder } from "fast-xml-parser";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// Your playlist JSON (hosted by you)
+// Playlist JSON URL (set via OSC parameter store)
 const PLAYLIST_URL =
   process.env.PLAYLIST_URL || "https://static.nenda.com/misc/vilmer_tv.json";
 
@@ -45,7 +45,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Basic request logging (useful for debugging)
+// Basic request logging
 app.use((req, _res, next) => {
   console.log(`${new Date().toISOString()} ${req.method} ${req.url}`);
   next();
@@ -78,13 +78,12 @@ function getItemDurationSeconds(item) {
   return Number.isFinite(d) && d > 0 ? d : DEFAULT_ITEM_DURATION_SECONDS;
 }
 
-// Heuristic: derive BaseURL from an MPD URL by trimming to the directory
+// Derive BaseURL from an MPD URL by trimming to the directory
 function baseUrlFromMpdUrl(mpdUrl) {
   try {
     const u = new URL(mpdUrl);
     u.hash = "";
     u.search = "";
-    // remove last path segment (manifest.mpd)
     u.pathname = u.pathname.replace(/[^/]*$/, "");
     return u.toString();
   } catch {
@@ -104,9 +103,7 @@ app.get("/channel.mpd", async (_req, res) => {
     const playlistJson = await playlistResp.json();
     const items = pickItems(playlistJson);
 
-    if (!items.length) {
-      return res.status(400).send("Playlist has no items");
-    }
+    if (!items.length) return res.status(400).send("Playlist has no items");
 
     // 2) Determine schedule rotation point (loop forever)
     const durationsSec = items.map(getItemDurationSeconds);
@@ -142,10 +139,13 @@ app.get("/channel.mpd", async (_req, res) => {
       ? templateMpd.MPD.Period[0]
       : templateMpd.MPD?.Period;
 
-    const adaptationSets = templatePeriod?.AdaptationSet;
+    let adaptationSets = templatePeriod?.AdaptationSet;
     if (!adaptationSets) {
       return res.status(500).send("Template MPD missing Period/AdaptationSet");
     }
+
+    // Normalize AdaptationSet to array to avoid malformed XML in some cases
+    if (!Array.isArray(adaptationSets)) adaptationSets = [adaptationSets];
 
     // 4) Build stitched MPD
     const outMpd = deepClone(templateMpd);
@@ -186,6 +186,7 @@ app.get("/channel.mpd", async (_req, res) => {
       periodStart += dur;
     }
 
+    // IMPORTANT: replace Period completely with our stitched periods
     outMpd.MPD.Period = periods;
 
     const xml = xmlBuilder.build(outMpd);
