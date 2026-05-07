@@ -97,6 +97,47 @@ function baseUrlFromMpdUrl(mpdUrl) {
   return u.toString();
 }
 
+// Fetch with per-attempt timeout + retry on 5xx / network errors. A slow or
+// briefly-unavailable upstream shouldn't take down a request — Shaka's retry
+// budget is limited and a single failed fetch can stall playback.
+async function fetchWithRetry(url, fetchOpts = {}, retryOpts = {}) {
+  const {
+    timeoutMs = 15_000,
+    maxAttempts = 3,
+    backoffMs = 400,
+  } = retryOpts;
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+      const resp = await fetch(url, {
+        redirect: "follow",
+        ...fetchOpts,
+        signal: ac.signal,
+      });
+      clearTimeout(timer);
+      if (resp.status >= 500 && attempt < maxAttempts) {
+        try {
+          resp.body?.destroy?.();
+        } catch {}
+        await new Promise((r) => setTimeout(r, backoffMs * attempt));
+        continue;
+      }
+      return resp;
+    } catch (e) {
+      clearTimeout(timer);
+      lastErr = e;
+      if (attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, backoffMs * attempt));
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr;
+}
+
 // Cache parsed upstream MPDs so /channel.mpd doesn't refetch every request.
 const MPD_CACHE_TTL_MS = 60_000;
 const mpdCache = new Map(); // mpdUrl -> { parsed, fetchedAt }
@@ -105,7 +146,7 @@ async function fetchMpdParsed(mpdUrl) {
   const now = Date.now();
   const cached = mpdCache.get(mpdUrl);
   if (cached && now - cached.fetchedAt < MPD_CACHE_TTL_MS) return cached.parsed;
-  const resp = await fetch(mpdUrl);
+  const resp = await fetchWithRetry(mpdUrl, { method: "GET" });
   if (!resp.ok) {
     throw new Error(`Failed to fetch upstream MPD ${mpdUrl}: ${resp.status}`);
   }
@@ -145,7 +186,42 @@ function parseIso8601DurationToSeconds(s) {
   return Number.isFinite(total) && total > 0 ? total : null;
 }
 
+function adaptationSetTotalSeconds(as) {
+  const st = as?.SegmentTemplate;
+  if (!st) return null;
+  const ts = parseInt(st["@_timescale"] || "1", 10);
+  if (!Number.isFinite(ts) || ts <= 0) return null;
+  const tl = st.SegmentTimeline;
+  if (!tl) return null;
+  let sList = tl.S;
+  if (!sList) return null;
+  if (!Array.isArray(sList)) sList = [sList];
+  let totalTicks = 0;
+  for (const s of sList) {
+    const d = parseInt(s?.["@_d"], 10);
+    const r = parseInt(s?.["@_r"] || "0", 10);
+    if (Number.isFinite(d) && d > 0) {
+      totalTicks += d * (Number.isFinite(r) ? r + 1 : 1);
+    }
+  }
+  return totalTicks > 0 ? totalTicks / ts : null;
+}
+
+// Use the MINIMUM of all AdaptationSet timeline lengths in the upstream MPD.
+// mediaPresentationDuration is typically the MAX (longest track), which leaves
+// shorter tracks under-covered at the period boundary — Safari MSE silently
+// stalls when audio outruns video by even a few milliseconds.
 function upstreamDurationSeconds(parsed) {
+  const adaptationSets = adaptationSetsFromParsed(parsed);
+  if (adaptationSets) {
+    let minDur = Infinity;
+    for (const as of adaptationSets) {
+      const d = adaptationSetTotalSeconds(as);
+      if (d && d < minDur) minDur = d;
+    }
+    if (Number.isFinite(minDur) && minDur > 0) return minDur;
+  }
+  // Fallbacks (less accurate, in this order):
   const fromMpd = parseIso8601DurationToSeconds(
     parsed.MPD?.["@_mediaPresentationDuration"]
   );
@@ -209,11 +285,13 @@ app.get("/p/:token/*", async (req, res) => {
     };
     if (req.headers.range) headers["range"] = req.headers.range;
 
-    const upstreamResp = await fetch(upstreamUrl, {
-      method: "GET",
-      headers,
-      redirect: "follow",
-    });
+    const upstreamResp = await fetchWithRetry(
+      upstreamUrl,
+      { method: "GET", headers },
+      // Segment fetches: a bit more aggressive than MPDs since Shaka retries
+      // are themselves expensive (manifest reparse, buffer reset).
+      { timeoutMs: 20_000, maxAttempts: 3, backoffMs: 300 }
+    );
 
     res.status(upstreamResp.status);
 
@@ -379,23 +457,6 @@ app.get("/channel.mpd", async (req, res) => {
       }
       return id;
     };
-    // period-connectivity:2018 (not -continuity:2015) — same logical stream
-    // across periods, but the player MUST refetch init segments at the
-    // boundary because each VOD comes from a different encoder run with
-    // slightly different SPS/PPS. Continuity-2015 would tell Shaka to reuse
-    // the prior init, which silently breaks decoding (fade to black).
-    const addPeriodConnectivity = (as, stableId) => {
-      const prop = {
-        "@_schemeIdUri": "urn:mpeg:dash:period-connectivity:2018",
-        "@_value": String(stableId),
-      };
-      const existing = as.SupplementalProperty;
-      if (!existing) as.SupplementalProperty = prop;
-      else if (Array.isArray(existing))
-        as.SupplementalProperty = [...existing, prop];
-      else as.SupplementalProperty = [existing, prop];
-    };
-
     const periods = [];
     for (const spec of specs) {
       const itemMpd = mpdByUrl.get(spec.mpdUrl);
@@ -406,11 +467,15 @@ app.get("/channel.mpd", async (req, res) => {
       const token = Buffer.from(upstreamBase, "utf8").toString("base64url");
       const proxiedBase = `https://${req.get("host")}/p/${token}/`;
 
+      // Stable AS @id by canonical content lets Shaka match the same logical
+      // rendition across periods. Default multi-period transitions (no
+      // continuity/connectivity hint) reset the SourceBuffer and timestampOffset
+      // per period — which is what we need for VODs from different encoder
+      // sessions with slightly different SPS/PPS.
       const adaptationSetsForPeriod = itemAdaptationSets.map((as) => {
         const cloned = deepClone(as);
         const stableId = getStableAsId(cloned);
         cloned["@_id"] = String(stableId);
-        addPeriodConnectivity(cloned, stableId);
         return cloned;
       });
 
