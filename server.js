@@ -195,12 +195,19 @@ app.get("/channel.mpd", async (_req, res) => {
     // 4) Build stitched MPD
     const outMpd = deepClone(templateMpd);
 
-// Serve as VOD-style MPD (static) so Shaka doesn't require live start-time/live-edge
-outMpd.MPD["@_type"] = "static";
-delete outMpd.MPD["@_minimumUpdatePeriod"];
-delete outMpd.MPD["@_timeShiftBufferDepth"];
-delete outMpd.MPD["@_suggestedPresentationDelay"];
-delete outMpd.MPD["@_availabilityStartTime"];
+const CHANNEL_START_TIME = process.env.CHANNEL_START_TIME; // ISO8601 UTC, required
+const DVR_WINDOW_SECONDS = Number(process.env.DVR_WINDOW_SECONDS || 3600);
+const SUGGESTED_DELAY_SECONDS = Number(process.env.SUGGESTED_DELAY_SECONDS || 20);
+
+if (!CHANNEL_START_TIME) {
+  return res.status(500).send("Missing env CHANNEL_START_TIME");
+}
+
+outMpd.MPD["@_type"] = "dynamic";
+outMpd.MPD["@_availabilityStartTime"] = CHANNEL_START_TIME;
+outMpd.MPD["@_minimumUpdatePeriod"] = "PT5S";
+outMpd.MPD["@_timeShiftBufferDepth"] = `PT${DVR_WINDOW_SECONDS}S`;
+outMpd.MPD["@_suggestedPresentationDelay"] = `PT${SUGGESTED_DELAY_SECONDS}S`;
 
     // Remove static duration if present
     delete outMpd.MPD["@_mediaPresentationDuration"];
