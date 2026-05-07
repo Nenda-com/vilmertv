@@ -356,6 +356,41 @@ app.get("/channel.mpd", async (req, res) => {
 
     delete outMpd.MPD["@_mediaPresentationDuration"];
 
+    // Assign a stable AdaptationSet @id per canonical rendition (contentType +
+    // mimeType + resolution + lang + trick-play flag) and tag each set with
+    // urn:mpeg:dash:period-continuity:2015 so Shaka can chain the same logical
+    // rendition across periods. Without this, two periods both labelling their
+    // 720p set as id="1" while another period labels id="1" as 540p breaks the
+    // boundary transition.
+    const stableAsIds = new Map();
+    let nextStableId = 1;
+    const getStableAsId = (as) => {
+      const key = [
+        as["@_contentType"] || "",
+        as["@_mimeType"] || "",
+        `${as["@_maxWidth"] || ""}x${as["@_maxHeight"] || ""}`,
+        as["@_lang"] || "",
+        as["@_codingDependency"] === "false" ? "trick" : "main",
+      ].join("|");
+      let id = stableAsIds.get(key);
+      if (id === undefined) {
+        id = nextStableId++;
+        stableAsIds.set(key, id);
+      }
+      return id;
+    };
+    const addPeriodContinuity = (as, stableId) => {
+      const prop = {
+        "@_schemeIdUri": "urn:mpeg:dash:period-continuity:2015",
+        "@_value": String(stableId),
+      };
+      const existing = as.SupplementalProperty;
+      if (!existing) as.SupplementalProperty = prop;
+      else if (Array.isArray(existing))
+        as.SupplementalProperty = [...existing, prop];
+      else as.SupplementalProperty = [existing, prop];
+    };
+
     const periods = [];
     for (const spec of specs) {
       const itemMpd = mpdByUrl.get(spec.mpdUrl);
@@ -366,12 +401,20 @@ app.get("/channel.mpd", async (req, res) => {
       const token = Buffer.from(upstreamBase, "utf8").toString("base64url");
       const proxiedBase = `https://${req.get("host")}/p/${token}/`;
 
+      const adaptationSetsForPeriod = itemAdaptationSets.map((as) => {
+        const cloned = deepClone(as);
+        const stableId = getStableAsId(cloned);
+        cloned["@_id"] = String(stableId);
+        addPeriodContinuity(cloned, stableId);
+        return cloned;
+      });
+
       periods.push({
         "@_id": spec.id,
         "@_start": `PT${spec.absStart}S`,
         "@_duration": `PT${spec.dur}S`,
         BaseURL: proxiedBase,
-        AdaptationSet: deepClone(itemAdaptationSets),
+        AdaptationSet: adaptationSetsForPeriod,
       });
     }
 
