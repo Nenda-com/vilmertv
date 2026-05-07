@@ -5,16 +5,13 @@ import { XMLParser, XMLBuilder } from "fast-xml-parser";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// Playlist JSON URL (set via OSC parameter store)
 const PLAYLIST_URL =
   process.env.PLAYLIST_URL || "https://static.nenda.com/misc/vilmer_tv.json";
 
-// Fallback if an item does not include durationSeconds
 const DEFAULT_ITEM_DURATION_SECONDS = Number(
   process.env.DEFAULT_ITEM_DURATION_SECONDS || 1800
 );
 
-// How many upcoming VODs to expose as Periods in the MPD at any time
 const WINDOW_ITEMS = Number(process.env.WINDOW_ITEMS || 5);
 
 const xmlParser = new XMLParser({
@@ -27,7 +24,7 @@ const xmlBuilder = new XMLBuilder({
   format: true,
 });
 
-// --- CORS + Range support (needed for Shaka / browser playback) ---
+// CORS + Range (browser/Shaka)
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,OPTIONS");
@@ -40,12 +37,10 @@ app.use((req, res, next) => {
     "Content-Length, Content-Range, Accept-Ranges"
   );
   res.setHeader("Accept-Ranges", "bytes");
-
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
-// Basic request logging
 app.use((req, _res, next) => {
   console.log(`${new Date().toISOString()} ${req.method} ${req.url}`);
   next();
@@ -58,7 +53,6 @@ function deepClone(obj) {
 }
 
 function pickItems(playlistJson) {
-  // support a couple of common shapes
   if (Array.isArray(playlistJson?.items)) return playlistJson.items;
   if (Array.isArray(playlistJson?.programs)) return playlistJson.programs;
   if (Array.isArray(playlistJson)) return playlistJson;
@@ -78,7 +72,6 @@ function getItemDurationSeconds(item) {
   return Number.isFinite(d) && d > 0 ? d : DEFAULT_ITEM_DURATION_SECONDS;
 }
 
-// Derive BaseURL from an MPD URL by trimming to the directory
 function baseUrlFromMpdUrl(mpdUrl) {
   try {
     const u = new URL(mpdUrl);
@@ -91,35 +84,57 @@ function baseUrlFromMpdUrl(mpdUrl) {
   }
 }
 
-// Normalize any valueless/boolean-ish XML attributes to valid XML values.
-// Example culprit: segmentAlignment (present but no value) => segmentAlignment="true"
-function normalizeXmlBooleanAttrs(node) {
+/**
+ * Fix invalid XML boolean attrs.
+ *
+ * We handle two representations that can appear after parsing:
+ *  A) Attributes: { "@_segmentAlignment": "" | true }  -> "@_segmentAlignment": "true"
+ *  B) Bare keys:  { "segmentAlignment": true | "" }   -> move to "@_segmentAlignment": "true" and delete bare key
+ */
+function normalizeXmlBooleans(node) {
   if (!node || typeof node !== "object") return;
 
   for (const [k, v] of Object.entries(node)) {
+    // A) attribute form
     if (k.startsWith("@_") && (v === "" || v === true || v === null)) {
       node[k] = "true";
       continue;
     }
-    if (typeof v === "object") normalizeXmlBooleanAttrs(v);
+
+    // B) bare-key boolean-ish form -> convert to attribute
+    if (!k.startsWith("@_") && (v === "" || v === true)) {
+      const attrKey = `@_${k}`;
+      // only convert known DASH boolean-ish attrs to avoid accidental conversion of normal fields
+      const known = new Set([
+        "segmentAlignment",
+        "subsegmentAlignment",
+        "bitstreamSwitching",
+      ]);
+      if (known.has(k)) {
+        node[attrKey] = "true";
+        delete node[k];
+        continue;
+      }
+    }
+
+    if (typeof v === "object") normalizeXmlBooleans(v);
   }
 }
 
 app.get("/channel.mpd", async (_req, res) => {
   try {
-    // 1) Load playlist
     const playlistResp = await fetch(PLAYLIST_URL, { redirect: "follow" });
     if (!playlistResp.ok) {
       return res
         .status(502)
         .send(`Failed to fetch playlist: ${playlistResp.status}`);
     }
+
     const playlistJson = await playlistResp.json();
     const items = pickItems(playlistJson);
-
     if (!items.length) return res.status(400).send("Playlist has no items");
 
-    // 2) Determine schedule rotation point (loop forever)
+    // Loop forever: pick current item based on wall-clock modulo total duration
     const durationsSec = items.map(getItemDurationSeconds);
     const totalMs = durationsSec.reduce((a, b) => a + b, 0) * 1000;
     const now = Date.now();
@@ -136,7 +151,6 @@ app.get("/channel.mpd", async (_req, res) => {
       acc += dMs;
     }
 
-    // 3) Fetch a template MPD (we reuse its AdaptationSets/Representations)
     const templateUrl = getItemUrl(items[startIdx]) || getItemUrl(items[0]);
     if (!templateUrl) {
       return res.status(400).send("Playlist item missing MPD url (asset.url)");
@@ -144,11 +158,8 @@ app.get("/channel.mpd", async (_req, res) => {
 
     const templateText = await (await fetch(templateUrl)).text();
     const parsed = xmlParser.parse(templateText);
-
-    // MPD root may be parsed as { MPD: {...} }
     const templateMpd = parsed?.MPD ? parsed : { MPD: parsed };
 
-    // Find AdaptationSet structure from the template
     const templatePeriod = Array.isArray(templateMpd.MPD?.Period)
       ? templateMpd.MPD.Period[0]
       : templateMpd.MPD?.Period;
@@ -157,17 +168,14 @@ app.get("/channel.mpd", async (_req, res) => {
     if (!adaptationSets) {
       return res.status(500).send("Template MPD missing Period/AdaptationSet");
     }
-
-    // Normalize AdaptationSet to array
     if (!Array.isArray(adaptationSets)) adaptationSets = [adaptationSets];
 
-    // Fix invalid XML boolean attrs like segmentAlignment
-    for (const as of adaptationSets) normalizeXmlBooleanAttrs(as);
+    // Normalize invalid boolean attributes inside AdaptationSets
+    for (const as of adaptationSets) normalizeXmlBooleans(as);
 
-    // 4) Build stitched MPD
     const outMpd = deepClone(templateMpd);
 
-    // Make it live-like
+    // Live-like MPD
     outMpd.MPD["@_type"] = "dynamic";
     outMpd.MPD["@_minimumUpdatePeriod"] =
       outMpd.MPD["@_minimumUpdatePeriod"] || "PT5S";
@@ -175,15 +183,13 @@ app.get("/channel.mpd", async (_req, res) => {
       outMpd.MPD["@_timeShiftBufferDepth"] || "PT3600S";
     outMpd.MPD["@_suggestedPresentationDelay"] =
       outMpd.MPD["@_suggestedPresentationDelay"] || "PT20S";
-
-    // Remove static duration if present
     delete outMpd.MPD["@_mediaPresentationDuration"];
 
-    // Build rolling window of Periods
+    // Rolling window of Periods
     const periods = [];
     let periodStart = 0;
-
     const count = Math.min(WINDOW_ITEMS, items.length);
+
     for (let k = 0; k < count; k++) {
       const idx = (startIdx + k) % items.length;
       const it = items[idx];
@@ -203,11 +209,9 @@ app.get("/channel.mpd", async (_req, res) => {
       periodStart += dur;
     }
 
-    // IMPORTANT: replace Period completely with our stitched periods
     outMpd.MPD.Period = periods;
 
     const xml = xmlBuilder.build(outMpd);
-
     res.set("Content-Type", "application/dash+xml; charset=utf-8");
     res.status(200).send(xml);
   } catch (e) {
@@ -215,7 +219,6 @@ app.get("/channel.mpd", async (_req, res) => {
     res.status(500).send(`Error generating MPD: ${e?.message || e}`);
   }
 });
-
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`vilmertv listening on 0.0.0.0:${PORT}`);
   console.log(`PLAYLIST_URL=${PLAYLIST_URL}`);
