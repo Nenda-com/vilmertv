@@ -17,17 +17,21 @@ const DEFAULT_ITEM_DURATION_SECONDS = Number(
 // How many upcoming VODs to expose as Periods in the MPD at any time
 const WINDOW_ITEMS = Number(process.env.WINDOW_ITEMS || 5);
 
+// Live tune-in config
+const CHANNEL_START_TIME = process.env.CHANNEL_START_TIME; // ISO8601 UTC, required
+const DVR_WINDOW_SECONDS = Number(process.env.DVR_WINDOW_SECONDS || 3600);
+const SUGGESTED_DELAY_SECONDS = Number(process.env.SUGGESTED_DELAY_SECONDS || 20);
+
 const xmlParser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: "@_",
 });
+
 const xmlBuilder = new XMLBuilder({
   ignoreAttributes: false,
   attributeNamePrefix: "@_",
   format: true,
-  // Default is true, which strips values of attributes equal to "true"
-  // (e.g. `segmentAlignment="true"` becomes a bare `segmentAlignment`).
-  // That produces invalid XML for DASH MPDs — keep the explicit value.
+  // Keep explicit boolean attribute values (DASH MPD must be valid XML)
   suppressBooleanAttributes: false,
 });
 
@@ -41,7 +45,7 @@ app.use((req, res, next) => {
   );
   res.setHeader(
     "Access-Control-Expose-Headers",
-    "Content-Length, Content-Range, Accept-Ranges"
+    "Content-Length, Content-Range, Accept-Ranges, ETag"
   );
   res.setHeader("Accept-Ranges", "bytes");
 
@@ -84,28 +88,16 @@ function getItemDurationSeconds(item) {
 
 // Derive BaseURL from an MPD URL by trimming to the directory
 function baseUrlFromMpdUrl(mpdUrl) {
-  try {
-    const u = new URL(mpdUrl);
-    u.hash = "";
-    u.search = "";
-    u.pathname = u.pathname.replace(/[^/]*$/, "");
-    return u.toString();
-  } catch {
-    return mpdUrl.replace(/\/[^/]*$/, "/");
-  }
+  const u = new URL(mpdUrl);
+  u.hash = "";
+  u.search = "";
+  u.pathname = u.pathname.replace(/[^/]*$/, "");
+  return u.toString();
 }
 
 /**
  * Sanitize boolean-ish DASH attributes so the produced XML is valid.
- *
- * Problem: some MPDs contain valueless boolean attributes like:
- *   <AdaptationSet ... segmentAlignment startWithSAP="1">
- * That is NOT valid XML (must be segmentAlignment="true").
- *
- * This function:
- * - converts bare keys (segmentAlignment: true/"") to attributes (@_segmentAlignment="true")
- * - converts valueless attributes (@_foo: ""|true|null) to "true"
- * - walks the entire object tree (so we don't miss where it appears)
+ * Converts valueless boolean attributes into explicit ="true".
  */
 function sanitizeDashXmlBooleans(node) {
   if (!node || typeof node !== "object") return;
@@ -135,9 +127,76 @@ function sanitizeDashXmlBooleans(node) {
     if (typeof v === "object") sanitizeDashXmlBooleans(v);
   }
 }
-
-app.get("/channel.mpd", async (_req, res) => {
+/**
+ * Proxy endpoint with Range support.
+ * Usage: /proxy?u=<urlencoded absolute URL>
+ *
+ * - Forwards Range header
+ * - Follows redirects
+ * - Streams bytes back
+ * - Adds CORS + exposes Content-Range headers
+ */
+app.get("/proxy", async (req, res) => {
   try {
+    const u = req.query.u;
+    if (!u) return res.status(400).send("Missing query param u");
+
+    const upstreamUrl = decodeURIComponent(String(u));
+    if (!/^https?:\/\//i.test(upstreamUrl)) {
+      return res.status(400).send("Invalid upstream URL (must be http/https)");
+    }
+
+    const headers = {
+      "user-agent": "osc-vod2live-proxy/1.0",
+      accept: "*/*",
+    };
+    if (req.headers.range) headers["range"] = req.headers.range;
+
+    const upstreamResp = await fetch(upstreamUrl, {
+      method: "GET",
+      headers,
+      redirect: "follow",
+    });
+
+    res.status(upstreamResp.status);
+
+    // Pass through important headers for MSE/DASH
+    const passthrough = [
+      "content-type",
+      "content-length",
+      "content-range",
+      "accept-ranges",
+      "etag",
+      "cache-control",
+      "last-modified",
+    ];
+    for (const h of passthrough) {
+      const v = upstreamResp.headers.get(h);
+      if (v) res.setHeader(h, v);
+    }
+
+    // Ensure CORS + expose range headers (even if upstream doesn't)
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader(
+      "Access-Control-Expose-Headers",
+      "Content-Length, Content-Range, Accept-Ranges, ETag"
+    );
+    res.setHeader("Accept-Ranges", "bytes");
+
+    if (!upstreamResp.body) return res.end();
+    upstreamResp.body.pipe(res);
+  } catch (e) {
+    console.error(e);
+    res.status(502).send(`Proxy error: ${e?.message || e}`);
+  }
+});
+
+app.get("/channel.mpd", async (req, res) => {
+  try {
+    if (!CHANNEL_START_TIME) {
+      return res.status(500).send("Missing env CHANNEL_START_TIME");
+    }
+
     // 1) Load playlist
     const playlistResp = await fetch(PLAYLIST_URL, { redirect: "follow" });
     if (!playlistResp.ok) {
@@ -195,19 +254,12 @@ app.get("/channel.mpd", async (_req, res) => {
     // 4) Build stitched MPD
     const outMpd = deepClone(templateMpd);
 
-const CHANNEL_START_TIME = process.env.CHANNEL_START_TIME; // ISO8601 UTC, required
-const DVR_WINDOW_SECONDS = Number(process.env.DVR_WINDOW_SECONDS || 3600);
-const SUGGESTED_DELAY_SECONDS = Number(process.env.SUGGESTED_DELAY_SECONDS || 20);
-
-if (!CHANNEL_START_TIME) {
-  return res.status(500).send("Missing env CHANNEL_START_TIME");
-}
-
-outMpd.MPD["@_type"] = "dynamic";
-outMpd.MPD["@_availabilityStartTime"] = CHANNEL_START_TIME;
-outMpd.MPD["@_minimumUpdatePeriod"] = "PT5S";
-outMpd.MPD["@_timeShiftBufferDepth"] = `PT${DVR_WINDOW_SECONDS}S`;
-outMpd.MPD["@_suggestedPresentationDelay"] = `PT${SUGGESTED_DELAY_SECONDS}S`;
+    // Live-like MPD (real wall clock)
+    outMpd.MPD["@_type"] = "dynamic";
+    outMpd.MPD["@_availabilityStartTime"] = CHANNEL_START_TIME;
+    outMpd.MPD["@_minimumUpdatePeriod"] = "PT5S";
+    outMpd.MPD["@_timeShiftBufferDepth"] = `PT${DVR_WINDOW_SECONDS}S`;
+    outMpd.MPD["@_suggestedPresentationDelay"] = `PT${SUGGESTED_DELAY_SECONDS}S`;
 
     // Remove static duration if present
     delete outMpd.MPD["@_mediaPresentationDuration"];
@@ -225,21 +277,26 @@ outMpd.MPD["@_suggestedPresentationDelay"] = `PT${SUGGESTED_DELAY_SECONDS}S`;
 
       const dur = getItemDurationSeconds(it);
 
+      const upstreamBase = baseUrlFromMpdUrl(mpdUrl);
+      const proxiedBase = `${req.protocol}://${req.get(
+        "host"
+      )}/proxy?u=${encodeURIComponent(upstreamBase)}`;
+
       periods.push({
         "@_id": getItemId(it, idx),
         "@_start": `PT${periodStart}S`,
         "@_duration": `PT${dur}S`,
-        BaseURL: baseUrlFromMpdUrl(mpdUrl),
+        BaseURL: proxiedBase,
         AdaptationSet: adaptationSets,
       });
 
       periodStart += dur;
     }
 
-    // IMPORTANT: replace Period completely with our stitched periods
+    // Replace Period completely with our stitched periods
     outMpd.MPD.Period = periods;
 
-    // FINAL SANITIZE STEP: ensure output XML is valid
+    // Ensure output XML is valid
     sanitizeDashXmlBooleans(outMpd);
 
     const xml = xmlBuilder.build(outMpd);
@@ -257,4 +314,8 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`PLAYLIST_URL=${PLAYLIST_URL}`);
   console.log(`WINDOW_ITEMS=${WINDOW_ITEMS}`);
   console.log(`DEFAULT_ITEM_DURATION_SECONDS=${DEFAULT_ITEM_DURATION_SECONDS}`);
+  console.log(`CHANNEL_START_TIME=${CHANNEL_START_TIME}`);
+  console.log(`DVR_WINDOW_SECONDS=${DVR_WINDOW_SECONDS}`);
+  console.log(`SUGGESTED_DELAY_SECONDS=${SUGGESTED_DELAY_SECONDS}`);
 });
+
