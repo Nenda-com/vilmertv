@@ -94,7 +94,6 @@ function baseUrlFromMpdUrl(mpdUrl) {
   u.pathname = u.pathname.replace(/[^/]*$/, "");
   return u.toString();
 }
-
 /**
  * Sanitize boolean-ish DASH attributes so the produced XML is valid.
  * Converts valueless boolean attributes into explicit ="true".
@@ -127,27 +126,46 @@ function sanitizeDashXmlBooleans(node) {
     if (typeof v === "object") sanitizeDashXmlBooleans(v);
   }
 }
-/**
- * Proxy endpoint with Range support.
- * Usage: /proxy?u=<urlencoded absolute URL>
- *
- * - Forwards Range header
- * - Follows redirects
- * - Streams bytes back
- * - Adds CORS + exposes Content-Range headers
- */
-app.get("/proxy", async (req, res) => {
-  try {
-    const u = req.query.u;
-    if (!u) return res.status(400).send("Missing query param u");
 
-    const upstreamUrl = decodeURIComponent(String(u));
-    if (!/^https?:\/\//i.test(upstreamUrl)) {
-      return res.status(400).send("Invalid upstream URL (must be http/https)");
+// --- Path-based proxy (DASH-player compatible) ---
+
+function b64urlEncode(str) {
+  return Buffer.from(str, "utf8")
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function b64urlDecode(str) {
+  let s = str.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  return Buffer.from(s, "base64").toString("utf8");
+}
+
+/**
+ * GET /p/:b64/<path>
+ * - :b64 is base64url(upstreamBaseUrl) (must end with "/")
+ * - <path> is appended by DASH client (e.g. video_x/init.cmfv)
+ *
+ * Supports Range requests and follows redirects.
+ */
+app.get("/p/:b64/*", async (req, res) => {
+  try {
+    const upstreamBase = b64urlDecode(req.params.b64);
+
+    if (!/^https?:\/\//i.test(upstreamBase)) {
+      return res.status(400).send("Invalid upstream base");
+    }
+    if (!upstreamBase.endsWith("/")) {
+      return res.status(400).send("Upstream base must end with /");
     }
 
+    const suffix = req.params[0] || "";
+    const upstreamUrl = upstreamBase + suffix;
+
     const headers = {
-      "user-agent": "osc-vod2live-proxy/1.0",
+      "user-agent": "osc-vod2live-proxy/2.0",
       accept: "*/*",
     };
     if (req.headers.range) headers["range"] = req.headers.range;
@@ -160,7 +178,6 @@ app.get("/proxy", async (req, res) => {
 
     res.status(upstreamResp.status);
 
-    // Pass through important headers for MSE/DASH
     const passthrough = [
       "content-type",
       "content-length",
@@ -175,7 +192,7 @@ app.get("/proxy", async (req, res) => {
       if (v) res.setHeader(h, v);
     }
 
-    // Ensure CORS + expose range headers (even if upstream doesn't)
+    // Ensure CORS + expose range headers
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader(
       "Access-Control-Expose-Headers",
@@ -190,7 +207,6 @@ app.get("/proxy", async (req, res) => {
     res.status(502).send(`Proxy error: ${e?.message || e}`);
   }
 });
-
 app.get("/channel.mpd", async (req, res) => {
   try {
     if (!CHANNEL_START_TIME) {
@@ -278,7 +294,10 @@ app.get("/channel.mpd", async (req, res) => {
       const dur = getItemDurationSeconds(it);
 
       const upstreamBase = baseUrlFromMpdUrl(mpdUrl);
-const proxiedBase = `https://${req.get("host")}/proxy?u=${encodeURIComponent(upstreamBase)}`;
+      const b64 = b64urlEncode(upstreamBase);
+
+      // IMPORTANT: always https (req.protocol may be http behind ingress)
+      const proxiedBase = `https://${req.get("host")}/p/${b64}/`;
 
       periods.push({
         "@_id": getItemId(it, idx),
@@ -306,7 +325,6 @@ const proxiedBase = `https://${req.get("host")}/proxy?u=${encodeURIComponent(ups
     res.status(500).send(`Error generating MPD: ${e?.message || e}`);
   }
 });
-
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`vilmertv listening on 0.0.0.0:${PORT}`);
   console.log(`PLAYLIST_URL=${PLAYLIST_URL}`);
@@ -316,4 +334,3 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`DVR_WINDOW_SECONDS=${DVR_WINDOW_SECONDS}`);
   console.log(`SUGGESTED_DELAY_SECONDS=${SUGGESTED_DELAY_SECONDS}`);
 });
-
