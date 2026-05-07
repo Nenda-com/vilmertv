@@ -5,99 +5,202 @@ import { XMLParser, XMLBuilder } from "fast-xml-parser";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// Your playlist JSON (the one you host)
-const PLAYLIST_URL = process.env.PLAYLIST_URL || "https://static.nenda.com/misc/vilmer_tv.json";
+// Your playlist JSON (hosted by you)
+const PLAYLIST_URL =
+  process.env.PLAYLIST_URL || "https://static.nenda.com/misc/vilmer_tv.json";
 
-// How long each VOD “plays” in the channel timeline.
-// If you can’t reliably read durations from MPDs, we need this in the playlist.
-// For now: require durationSeconds per item (recommended).
-const DEFAULT_ITEM_DURATION_SECONDS = Number(process.env.DEFAULT_ITEM_DURATION_SECONDS || 1800);
+// Fallback if an item does not include durationSeconds
+const DEFAULT_ITEM_DURATION_SECONDS = Number(
+  process.env.DEFAULT_ITEM_DURATION_SECONDS || 1800
+);
 
-const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_" });
-const xmlBuilder = new XMLBuilder({ ignoreAttributes: false, attributeNamePrefix: "@_", format: true });
+// How many upcoming VODs to expose as Periods in the MPD at any time
+const WINDOW_ITEMS = Number(process.env.WINDOW_ITEMS || 5);
 
-app.get("/healthz", (_, res) => res.status(200).send("ok"));
+const xmlParser = new XMLParser({
+  ignoreAttributes: false,
+  attributeNamePrefix: "@_",
+});
+const xmlBuilder = new XMLBuilder({
+  ignoreAttributes: false,
+  attributeNamePrefix: "@_",
+  format: true,
+});
 
-app.get("/channel.mpd", async (req, res) => {
+// --- CORS + Range support (needed for Shaka / browser playback) ---
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Origin, Range, Accept, Content-Type"
+  );
+  res.setHeader(
+    "Access-Control-Expose-Headers",
+    "Content-Length, Content-Range, Accept-Ranges"
+  );
+  res.setHeader("Accept-Ranges", "bytes");
+
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+// Basic request logging (useful for debugging)
+app.use((req, _res, next) => {
+  console.log(`${new Date().toISOString()} ${req.method} ${req.url}`);
+  next();
+});
+
+app.get("/healthz", (_req, res) => res.status(200).send("ok"));
+
+function deepClone(obj) {
+  return JSON.parse(JSON.stringify(obj));
+}
+
+function pickItems(playlistJson) {
+  // support a couple of common shapes
+  if (Array.isArray(playlistJson?.items)) return playlistJson.items;
+  if (Array.isArray(playlistJson?.programs)) return playlistJson.programs;
+  if (Array.isArray(playlistJson)) return playlistJson;
+  return [];
+}
+
+function getItemUrl(item) {
+  return item?.asset?.url || item?.url || item?.mpdUrl;
+}
+
+function getItemId(item, idx) {
+  return item?.id || item?.assetId || `vod-${idx}`;
+}
+
+function getItemDurationSeconds(item) {
+  const d = Number(item?.durationSeconds);
+  return Number.isFinite(d) && d > 0 ? d : DEFAULT_ITEM_DURATION_SECONDS;
+}
+
+// Heuristic: derive BaseURL from an MPD URL by trimming to the directory
+function baseUrlFromMpdUrl(mpdUrl) {
   try {
-    const playlist = await (await fetch(PLAYLIST_URL)).json();
-    const items = playlist.items || playlist.programs || [];
-    if (!items.length) return res.status(400).send("Playlist has no items");
+    const u = new URL(mpdUrl);
+    u.hash = "";
+    u.search = "";
+    // remove last path segment (manifest.mpd)
+    u.pathname = u.pathname.replace(/[^/]*$/, "");
+    return u.toString();
+  } catch {
+    return mpdUrl.replace(/\/[^/]*$/, "/");
+  }
+}
 
-    // Looping “channel”: compute a rotating window based on wall-clock time.
-    // We build an MPD with multiple Periods, one per VOD, and rotate which one is “first”.
+app.get("/channel.mpd", async (_req, res) => {
+  try {
+    // 1) Load playlist
+    const playlistResp = await fetch(PLAYLIST_URL, { redirect: "follow" });
+    if (!playlistResp.ok) {
+      return res
+        .status(502)
+        .send(`Failed to fetch playlist: ${playlistResp.status}`);
+    }
+    const playlistJson = await playlistResp.json();
+    const items = pickItems(playlistJson);
+
+    if (!items.length) {
+      return res.status(400).send("Playlist has no items");
+    }
+
+    // 2) Determine schedule rotation point (loop forever)
+    const durationsSec = items.map(getItemDurationSeconds);
+    const totalMs = durationsSec.reduce((a, b) => a + b, 0) * 1000;
     const now = Date.now();
+    const offsetMs = totalMs > 0 ? now % totalMs : 0;
 
-    // Fetch and parse the *first* item MPD to use as template (AdaptationSets/Representations)
-    const firstUrl = items[0]?.asset?.url || items[0]?.url;
-    if (!firstUrl) return res.status(400).send("First item missing asset.url");
-
-    const firstMpdText = await (await fetch(firstUrl)).text();
-    const firstMpd = xmlParser.parse(firstMpdText);
-
-    // Build a simple dynamic MPD with Periods pointing at each VOD MPD BaseURL.
-    // Note: This is a pragmatic stitcher; it assumes uniform encoding/segmenting (your Encore profile).
-    const mpd = firstMpd.MPD ? structuredClone(firstMpd) : { MPD: firstMpd };
-
-    // Force dynamic (live-like)
-    mpd.MPD["@_type"] = "dynamic";
-    mpd.MPD["@_minimumUpdatePeriod"] = "PT5S";
-    mpd.MPD["@_timeShiftBufferDepth"] = "PT3600S";
-    mpd.MPD["@_suggestedPresentationDelay"] = "PT20S";
-
-    // Remove static-only fields if present
-    delete mpd.MPD["@_mediaPresentationDuration"];
-
-    // Compute durations (prefer explicit durationSeconds in playlist)
-    const durations = items.map((it) => Number(it.durationSeconds || DEFAULT_ITEM_DURATION_SECONDS));
-    const total = durations.reduce((a, b) => a + b, 0) * 1000;
-
-    const offset = now % total;
-
-    // Find starting index based on offset
     let acc = 0;
     let startIdx = 0;
-    for (let i = 0; i < durations.length; i++) {
-      const d = durations[i] * 1000;
-      if (acc + d > offset) { startIdx = i; break; }
-      acc += d;
+    for (let i = 0; i < durationsSec.length; i++) {
+      const dMs = durationsSec[i] * 1000;
+      if (acc + dMs > offsetMs) {
+        startIdx = i;
+        break;
+      }
+      acc += dMs;
     }
 
-    // Build a window of N periods ahead (keep MPD small)
-    const WINDOW_ITEMS = Number(process.env.WINDOW_ITEMS || 5);
-    const periods = [];
+    // 3) Fetch a template MPD (we reuse its AdaptationSets/Representations)
+    const templateUrl = getItemUrl(items[startIdx]) || getItemUrl(items[0]);
+    if (!templateUrl) {
+      return res.status(400).send("Playlist item missing MPD url (asset.url)");
+    }
 
-    let periodStartSeconds = 0;
-    for (let k = 0; k < Math.min(WINDOW_ITEMS, items.length); k++) {
+    const templateText = await (await fetch(templateUrl)).text();
+    const parsed = xmlParser.parse(templateText);
+
+    // MPD root may be parsed as { MPD: {...} }
+    const templateMpd = parsed?.MPD ? parsed : { MPD: parsed };
+
+    // Find AdaptationSet structure from the template
+    const templatePeriod = Array.isArray(templateMpd.MPD?.Period)
+      ? templateMpd.MPD.Period[0]
+      : templateMpd.MPD?.Period;
+
+    const adaptationSets = templatePeriod?.AdaptationSet;
+    if (!adaptationSets) {
+      return res.status(500).send("Template MPD missing Period/AdaptationSet");
+    }
+
+    // 4) Build stitched MPD
+    const outMpd = deepClone(templateMpd);
+
+    // Make it live-like
+    outMpd.MPD["@_type"] = "dynamic";
+    outMpd.MPD["@_minimumUpdatePeriod"] =
+      outMpd.MPD["@_minimumUpdatePeriod"] || "PT5S";
+    outMpd.MPD["@_timeShiftBufferDepth"] =
+      outMpd.MPD["@_timeShiftBufferDepth"] || "PT3600S";
+    outMpd.MPD["@_suggestedPresentationDelay"] =
+      outMpd.MPD["@_suggestedPresentationDelay"] || "PT20S";
+
+    // Remove static duration if present
+    delete outMpd.MPD["@_mediaPresentationDuration"];
+
+    // Build rolling window of Periods
+    const periods = [];
+    let periodStart = 0;
+
+    const count = Math.min(WINDOW_ITEMS, items.length);
+    for (let k = 0; k < count; k++) {
       const idx = (startIdx + k) % items.length;
       const it = items[idx];
-      const url = it?.asset?.url || it?.url;
-      const dur = durations[idx];
+      const mpdUrl = getItemUrl(it);
+      if (!mpdUrl) continue;
+
+      const dur = getItemDurationSeconds(it);
 
       periods.push({
-        "@_id": it.id || `vod-${idx}`,
-        "@_start": `PT${periodStartSeconds}S`,
+        "@_id": getItemId(it, idx),
+        "@_start": `PT${periodStart}S`,
         "@_duration": `PT${dur}S`,
-        BaseURL: url.replace(/\/manifest\.mpd.*$/, "/"), // base path heuristic
-        // Keep the same AdaptationSet structure as the template MPD
-        AdaptationSet: mpd.MPD.Period?.AdaptationSet || mpd.MPD.Period?.[0]?.AdaptationSet
+        BaseURL: baseUrlFromMpdUrl(mpdUrl),
+        AdaptationSet: adaptationSets,
       });
 
-      periodStartSeconds += dur;
+      periodStart += dur;
     }
 
-    // Replace Period with our stitched periods
-    mpd.MPD.Period = periods;
+    outMpd.MPD.Period = periods;
 
-    const out = xmlBuilder.build(mpd);
-    res.set("Content-Type", "application/dash+xml");
-    res.status(200).send(out);
+    const xml = xmlBuilder.build(outMpd);
+
+    res.set("Content-Type", "application/dash+xml; charset=utf-8");
+    res.status(200).send(xml);
   } catch (e) {
+    console.error(e);
     res.status(500).send(`Error generating MPD: ${e?.message || e}`);
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`vilmertv listening on :${PORT}`);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`vilmertv listening on 0.0.0.0:${PORT}`);
   console.log(`PLAYLIST_URL=${PLAYLIST_URL}`);
+  console.log(`WINDOW_ITEMS=${WINDOW_ITEMS}`);
+  console.log(`DEFAULT_ITEM_DURATION_SECONDS=${DEFAULT_ITEM_DURATION_SECONDS}`);
 });
