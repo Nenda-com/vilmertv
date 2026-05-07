@@ -22,6 +22,9 @@ const DVR_WINDOW_SECONDS = Number(process.env.DVR_WINDOW_SECONDS || 3600);
 const LIVE_EDGE_MARGIN_SECONDS = Number(
   process.env.LIVE_EDGE_MARGIN_SECONDS || 90
 );
+const SUGGESTED_DELAY_SECONDS = Number(
+  process.env.SUGGESTED_DELAY_SECONDS || 30
+);
 
 const xmlParser = new XMLParser({
   ignoreAttributes: false,
@@ -264,7 +267,7 @@ app.get("/channel.mpd", async (req, res) => {
       DVR_WINDOW_SECONDS,
       windowDurationSec
     )}S`;
-    outMpd.MPD["@_suggestedPresentationDelay"] = "PT0S";
+    outMpd.MPD["@_suggestedPresentationDelay"] = `PT${SUGGESTED_DELAY_SECONDS}S`;
 
     delete outMpd.MPD["@_mediaPresentationDuration"];
 
@@ -318,4 +321,5 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`DEFAULT_ITEM_DURATION_SECONDS=${DEFAULT_ITEM_DURATION_SECONDS}`);
   console.log(`DVR_WINDOW_SECONDS=${DVR_WINDOW_SECONDS}`);
   console.log(`LIVE_EDGE_MARGIN_SECONDS=${LIVE_EDGE_MARGIN_SECONDS}`);
+  console.log(`SUGGESTED_DELAY_SECONDS=${SUGGESTED_DELAY_SECONDS}`);
 });
