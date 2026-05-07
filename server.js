@@ -278,9 +278,7 @@ app.get("/channel.mpd", async (req, res) => {
       const dur = getItemDurationSeconds(it);
 
       const upstreamBase = baseUrlFromMpdUrl(mpdUrl);
-      const proxiedBase = `${req.protocol}://${req.get(
-        "host"
-      )}/proxy?u=${encodeURIComponent(upstreamBase)}`;
+const proxiedBase = `https://${req.get("host")}/proxy?u=${encodeURIComponent(upstreamBase)}`;
 
       periods.push({
         "@_id": getItemId(it, idx),
