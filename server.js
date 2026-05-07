@@ -31,7 +31,6 @@ const xmlBuilder = new XMLBuilder({
   ignoreAttributes: false,
   attributeNamePrefix: "@_",
   format: true,
-  // Keep explicit boolean attribute values (DASH MPD must be valid XML)
   suppressBooleanAttributes: false,
 });
 
@@ -66,7 +65,6 @@ function deepClone(obj) {
 }
 
 function pickItems(playlistJson) {
-  // support a couple of common shapes
   if (Array.isArray(playlistJson?.items)) return playlistJson.items;
   if (Array.isArray(playlistJson?.programs)) return playlistJson.programs;
   if (Array.isArray(playlistJson)) return playlistJson;
@@ -86,7 +84,6 @@ function getItemDurationSeconds(item) {
   return Number.isFinite(d) && d > 0 ? d : DEFAULT_ITEM_DURATION_SECONDS;
 }
 
-// Derive BaseURL from an MPD URL by trimming to the directory
 function baseUrlFromMpdUrl(mpdUrl) {
   const u = new URL(mpdUrl);
   u.hash = "";
@@ -94,10 +91,7 @@ function baseUrlFromMpdUrl(mpdUrl) {
   u.pathname = u.pathname.replace(/[^/]*$/, "");
   return u.toString();
 }
-/**
- * Sanitize boolean-ish DASH attributes so the produced XML is valid.
- * Converts valueless boolean attributes into explicit ="true".
- */
+
 function sanitizeDashXmlBooleans(node) {
   if (!node || typeof node !== "object") return;
 
@@ -110,14 +104,12 @@ function sanitizeDashXmlBooleans(node) {
   for (const k of Object.keys(node)) {
     const v = node[k];
 
-    // Bare key -> attribute with value
     if (booleanAttrs.has(k) && (v === "" || v === true || v === null)) {
       node[`@_${k}`] = "true";
       delete node[k];
       continue;
     }
 
-    // Attribute key but valueless -> set value
     if (k.startsWith("@_") && (v === "" || v === true || v === null)) {
       node[k] = "true";
       continue;
@@ -126,31 +118,18 @@ function sanitizeDashXmlBooleans(node) {
     if (typeof v === "object") sanitizeDashXmlBooleans(v);
   }
 }
-
-// --- Path-based proxy (DASH-player compatible) ---
-
-function b64urlEncode(str) {
-  return Buffer.from(str, "utf8")
-    .toString("base64")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/g, "");
-}
-function b64urlDecode(str) {
-  let s = str.replace(/-/g, "+").replace(/_/g, "/");
-  while (s.length % 4) s += "=";
-  return Buffer.from(s, "base64").toString("utf8");
-}
 /**
- * GET /p/:b64/<path>
- * - :b64 is base64url(upstreamBaseUrl) (must end with "/")
- * - <path> is appended by DASH client (e.g. video_x/init.cmfv)
+ * GET /p/:token/<path>
  *
- * Supports Range requests and follows redirects.
+ * :token is URL-encoded base64(upstreamBaseUrl). We use encodeURIComponent()
+ * so "/" becomes "%2F" and does not break the route.
+ *
+ * <path> is appended by the DASH client (e.g. video_x/init.cmfv)
  */
-app.get("/p/:b64/*", async (req, res) => {
+app.get("/p/:token/*", async (req, res) => {
   try {
-    const upstreamBase = b64urlDecode(req.params.b64);
+    const token = decodeURIComponent(req.params.token); // base64 string
+    const upstreamBase = Buffer.from(token, "base64").toString("utf8");
 
     if (!/^https?:\/\//i.test(upstreamBase)) {
       return res.status(400).send("Invalid upstream base");
@@ -163,7 +142,7 @@ app.get("/p/:b64/*", async (req, res) => {
     const upstreamUrl = upstreamBase + suffix;
 
     const headers = {
-      "user-agent": "osc-vod2live-proxy/2.0",
+      "user-agent": "osc-vod2live-proxy/3.0",
       accept: "*/*",
     };
     if (req.headers.range) headers["range"] = req.headers.range;
@@ -261,24 +240,19 @@ app.get("/channel.mpd", async (req, res) => {
     if (!adaptationSets) {
       return res.status(500).send("Template MPD missing Period/AdaptationSet");
     }
-
-    // Normalize AdaptationSet to array
     if (!Array.isArray(adaptationSets)) adaptationSets = [adaptationSets];
 
     // 4) Build stitched MPD
     const outMpd = deepClone(templateMpd);
 
-    // Live-like MPD (real wall clock)
     outMpd.MPD["@_type"] = "dynamic";
     outMpd.MPD["@_availabilityStartTime"] = CHANNEL_START_TIME;
     outMpd.MPD["@_minimumUpdatePeriod"] = "PT5S";
     outMpd.MPD["@_timeShiftBufferDepth"] = `PT${DVR_WINDOW_SECONDS}S`;
     outMpd.MPD["@_suggestedPresentationDelay"] = `PT${SUGGESTED_DELAY_SECONDS}S`;
 
-    // Remove static duration if present
     delete outMpd.MPD["@_mediaPresentationDuration"];
 
-    // Build rolling window of Periods
     const periods = [];
     let periodStart = 0;
 
@@ -291,13 +265,15 @@ app.get("/channel.mpd", async (req, res) => {
 
       const dur = getItemDurationSeconds(it);
 
-const upstreamBase = baseUrlFromMpdUrl(mpdUrl);
+      const upstreamBase = baseUrlFromMpdUrl(mpdUrl);
 
-// Inline base64url to guarantee no "/" ends up in the token
-let b64 = Buffer.from(upstreamBase, "utf8").toString("base64");
-b64 = b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+      // token is URL-encoded base64(upstreamBase)
+      const token = encodeURIComponent(
+        Buffer.from(upstreamBase, "utf8").toString("base64")
+      );
 
-const proxiedBase = `https://${req.get("host")}/p/${b64}/`;
+      // IMPORTANT: always https (req.protocol may be http behind ingress)
+      const proxiedBase = `https://${req.get("host")}/p/${token}/`;
 
       periods.push({
         "@_id": getItemId(it, idx),
@@ -310,10 +286,8 @@ const proxiedBase = `https://${req.get("host")}/p/${b64}/`;
       periodStart += dur;
     }
 
-    // Replace Period completely with our stitched periods
     outMpd.MPD.Period = periods;
 
-    // Ensure output XML is valid
     sanitizeDashXmlBooleans(outMpd);
 
     const xml = xmlBuilder.build(outMpd);
