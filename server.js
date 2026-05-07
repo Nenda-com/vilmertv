@@ -402,7 +402,67 @@ app.get("/p/:token/*", async (req, res) => {
     res.status(502).send(`Proxy error: ${e?.message || e}`);
   }
 });
+// Cache the generated manifest XML for a short TTL so a herd of clients all
+// refreshing every ~5s share one round of work. Single in-flight build is
+// shared via a promise, so concurrent cache misses don't all rebuild.
+const MANIFEST_CACHE_TTL_MS = 1500;
+let manifestCache = { xml: null, host: null, generatedAt: 0 };
+let manifestInFlight = null;
+
 app.get("/channel.mpd", async (req, res) => {
+  try {
+    const host = req.get("host");
+    const now = Date.now();
+    if (
+      manifestCache.xml &&
+      manifestCache.host === host &&
+      now - manifestCache.generatedAt < MANIFEST_CACHE_TTL_MS
+    ) {
+      res.set("Content-Type", "application/dash+xml; charset=utf-8");
+      return res.status(200).send(manifestCache.xml);
+    }
+    if (manifestInFlight) {
+      const xml = await manifestInFlight;
+      res.set("Content-Type", "application/dash+xml; charset=utf-8");
+      return res.status(200).send(xml);
+    }
+    manifestInFlight = (async () => {
+      try {
+        const xml = await buildChannelManifest(host);
+        manifestCache = { xml, host, generatedAt: Date.now() };
+        return xml;
+      } finally {
+        manifestInFlight = null;
+      }
+    })();
+    const xml = await manifestInFlight;
+    res.set("Content-Type", "application/dash+xml; charset=utf-8");
+    return res.status(200).send(xml);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).send(`Error generating MPD: ${e?.message || e}`);
+  }
+});
+
+async function buildChannelManifest(host) {
+  // Throws on error; caller maps to 500.
+  const req = { get: (k) => (k === "host" ? host : undefined) };
+  const res = {
+    _status: 200,
+    _body: null,
+    _ct: null,
+    status(c) { this._status = c; return this; },
+    send(b) { this._body = b; return this; },
+    set(k, v) { if (k.toLowerCase() === "content-type") this._ct = v; return this; },
+  };
+  await _channelMpdHandler(req, res);
+  if (res._status !== 200) {
+    throw new Error(`build failed: HTTP ${res._status} ${res._body}`);
+  }
+  return res._body;
+}
+
+async function _channelMpdHandler(req, res) {
   try {
     if (!CHANNEL_START_TIME) {
       return res.status(500).send("Missing env CHANNEL_START_TIME");
@@ -589,7 +649,7 @@ app.get("/channel.mpd", async (req, res) => {
     console.error(e);
     res.status(500).send(`Error generating MPD: ${e?.message || e}`);
   }
-});
+}
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`vilmertv listening on 0.0.0.0:${PORT}`);
   console.log(`PLAYLIST_URL=${PLAYLIST_URL}`);
