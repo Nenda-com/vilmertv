@@ -18,9 +18,7 @@ const DEFAULT_ITEM_DURATION_SECONDS = Number(
 const WINDOW_ITEMS = Number(process.env.WINDOW_ITEMS || 5);
 
 // Live tune-in config
-const CHANNEL_START_TIME = process.env.CHANNEL_START_TIME; // ISO8601 UTC, required
 const DVR_WINDOW_SECONDS = Number(process.env.DVR_WINDOW_SECONDS || 3600);
-const SUGGESTED_DELAY_SECONDS = Number(process.env.SUGGESTED_DELAY_SECONDS || 20);
 
 const xmlParser = new XMLParser({
   ignoreAttributes: false,
@@ -184,10 +182,6 @@ app.get("/p/:token/*", async (req, res) => {
 });
 app.get("/channel.mpd", async (req, res) => {
   try {
-    if (!CHANNEL_START_TIME) {
-      return res.status(500).send("Missing env CHANNEL_START_TIME");
-    }
-
     // 1) Load playlist
     const playlistResp = await fetch(PLAYLIST_URL, { redirect: "follow" });
     if (!playlistResp.ok) {
@@ -243,18 +237,33 @@ app.get("/channel.mpd", async (req, res) => {
     // 4) Build stitched MPD
     const outMpd = deepClone(templateMpd);
 
+    const count = Math.min(WINDOW_ITEMS, items.length);
+    let windowDurationSec = 0;
+    for (let k = 0; k < count; k++) {
+      const idx = (startIdx + k) % items.length;
+      windowDurationSec += getItemDurationSeconds(items[idx]);
+    }
+
+    // Make "now" align with the end of the published window so Shaka tunes in
+    // at the live edge: live edge = now - availabilityStartTime.
+    const availabilityStartTime = new Date(
+      Date.now() - windowDurationSec * 1000
+    ).toISOString();
+
     outMpd.MPD["@_type"] = "dynamic";
-    outMpd.MPD["@_availabilityStartTime"] = CHANNEL_START_TIME;
+    outMpd.MPD["@_availabilityStartTime"] = availabilityStartTime;
     outMpd.MPD["@_minimumUpdatePeriod"] = "PT5S";
-    outMpd.MPD["@_timeShiftBufferDepth"] = `PT${DVR_WINDOW_SECONDS}S`;
-    outMpd.MPD["@_suggestedPresentationDelay"] = `PT${SUGGESTED_DELAY_SECONDS}S`;
+    outMpd.MPD["@_timeShiftBufferDepth"] = `PT${Math.min(
+      DVR_WINDOW_SECONDS,
+      windowDurationSec
+    )}S`;
+    outMpd.MPD["@_suggestedPresentationDelay"] = "PT0S";
 
     delete outMpd.MPD["@_mediaPresentationDuration"];
 
     const periods = [];
     let periodStart = 0;
 
-    const count = Math.min(WINDOW_ITEMS, items.length);
     for (let k = 0; k < count; k++) {
       const idx = (startIdx + k) % items.length;
       const it = items[idx];
@@ -300,7 +309,5 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`PLAYLIST_URL=${PLAYLIST_URL}`);
   console.log(`WINDOW_ITEMS=${WINDOW_ITEMS}`);
   console.log(`DEFAULT_ITEM_DURATION_SECONDS=${DEFAULT_ITEM_DURATION_SECONDS}`);
-  console.log(`CHANNEL_START_TIME=${CHANNEL_START_TIME}`);
   console.log(`DVR_WINDOW_SECONDS=${DVR_WINDOW_SECONDS}`);
-  console.log(`SUGGESTED_DELAY_SECONDS=${SUGGESTED_DELAY_SECONDS}`);
 });
