@@ -195,14 +195,12 @@ app.get("/channel.mpd", async (_req, res) => {
     // 4) Build stitched MPD
     const outMpd = deepClone(templateMpd);
 
-    // Make it live-like
-    outMpd.MPD["@_type"] = "dynamic";
-    outMpd.MPD["@_minimumUpdatePeriod"] =
-      outMpd.MPD["@_minimumUpdatePeriod"] || "PT5S";
-    outMpd.MPD["@_timeShiftBufferDepth"] =
-      outMpd.MPD["@_timeShiftBufferDepth"] || "PT3600S";
-    outMpd.MPD["@_suggestedPresentationDelay"] =
-      outMpd.MPD["@_suggestedPresentationDelay"] || "PT20S";
+// Serve as VOD-style MPD (static) so Shaka doesn't require live start-time/live-edge
+outMpd.MPD["@_type"] = "static";
+delete outMpd.MPD["@_minimumUpdatePeriod"];
+delete outMpd.MPD["@_timeShiftBufferDepth"];
+delete outMpd.MPD["@_suggestedPresentationDelay"];
+delete outMpd.MPD["@_availabilityStartTime"];
 
     // Remove static duration if present
     delete outMpd.MPD["@_mediaPresentationDuration"];
