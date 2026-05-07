@@ -1,6 +1,24 @@
 import express from "express";
 import fetch from "node-fetch";
 import { XMLParser, XMLBuilder } from "fast-xml-parser";
+import http from "http";
+import https from "https";
+
+// Keep-alive agents so the proxy reuses TCP/TLS connections to upstream hosts.
+// Without this, every segment fetch pays the TCP+TLS handshake — adds 100s of
+// ms per request and visibly stalls period transitions on Shaka.
+const httpAgent = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30_000,
+  maxSockets: 64,
+});
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30_000,
+  maxSockets: 64,
+});
+const pickAgent = (url) =>
+  url.startsWith("https:") ? httpsAgent : httpAgent;
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -116,6 +134,7 @@ async function fetchWithRetry(url, fetchOpts = {}, retryOpts = {}) {
     try {
       const resp = await fetch(url, {
         redirect: "follow",
+        agent: pickAgent(url),
         ...fetchOpts,
         signal: ac.signal,
       });
