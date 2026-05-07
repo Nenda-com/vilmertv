@@ -98,7 +98,7 @@ function baseUrlFromMpdUrl(mpdUrl) {
 }
 
 // Cache parsed upstream MPDs so /channel.mpd doesn't refetch every request.
-const MPD_CACHE_TTL_MS = 10_000;
+const MPD_CACHE_TTL_MS = 60_000;
 const mpdCache = new Map(); // mpdUrl -> { parsed, fetchedAt }
 
 async function fetchMpdParsed(mpdUrl) {
@@ -124,6 +124,28 @@ function adaptationSetsFromParsed(parsed) {
   if (!as) return null;
   if (!Array.isArray(as)) as = [as];
   return as;
+}
+
+function parseIso8601DurationToSeconds(s) {
+  if (!s) return null;
+  const m = /^PT(?:([\d.]+)H)?(?:([\d.]+)M)?(?:([\d.]+)S)?$/.exec(s);
+  if (!m) return null;
+  const h = parseFloat(m[1] || 0);
+  const min = parseFloat(m[2] || 0);
+  const sec = parseFloat(m[3] || 0);
+  const total = h * 3600 + min * 60 + sec;
+  return Number.isFinite(total) && total > 0 ? total : null;
+}
+
+function upstreamDurationSeconds(parsed) {
+  const fromMpd = parseIso8601DurationToSeconds(
+    parsed.MPD?.["@_mediaPresentationDuration"]
+  );
+  if (fromMpd) return fromMpd;
+  const period = Array.isArray(parsed.MPD?.Period)
+    ? parsed.MPD.Period[0]
+    : parsed.MPD?.Period;
+  return parseIso8601DurationToSeconds(period?.["@_duration"]);
 }
 
 function sanitizeDashXmlBooleans(node) {
@@ -240,7 +262,22 @@ app.get("/channel.mpd", async (req, res) => {
 
     if (!items.length) return res.status(400).send("Playlist has no items");
 
-    const durationsSec = items.map(getItemDurationSeconds);
+    // 2) Fetch every item's upstream MPD in parallel (60s cache) so we can
+    //    use each VOD's true media duration — playlist durationSeconds is
+    //    integer-rounded and causes sub-frame gaps at period boundaries.
+    const allItemUrls = items.map(getItemUrl);
+    const fetched = await Promise.all(
+      allItemUrls.map(async (u) => (u ? [u, await fetchMpdParsed(u)] : null))
+    );
+    const mpdByUrl = new Map(fetched.filter(Boolean));
+
+    // Real per-item durations (fall back to playlist durationSeconds).
+    const durationsSec = items.map((it) => {
+      const u = getItemUrl(it);
+      const parsed = u ? mpdByUrl.get(u) : null;
+      const real = parsed ? upstreamDurationSeconds(parsed) : null;
+      return real && real > 0 ? real : getItemDurationSeconds(it);
+    });
     const loopDurationSec = durationsSec.reduce((a, b) => a + b, 0);
     if (loopDurationSec <= 0) {
       return res.status(400).send("Playlist has zero total duration");
@@ -251,10 +288,8 @@ app.get("/channel.mpd", async (req, res) => {
       return res.status(425).send("Channel has not started yet");
     }
 
-    // 2) Walk the loop and collect period specs that overlap the DVR window
-    //    plus up to WINDOW_ITEMS upcoming items. AdaptationSets are resolved
-    //    per-asset below — reusing one template's SegmentTimeline across
-    //    different assets causes 404s because segment numbering differs.
+    // 3) Walk the loop and collect period specs overlapping the DVR window
+    //    plus up to WINDOW_ITEMS upcoming items.
     const windowStartAbs = Math.max(0, nowSec - DVR_WINDOW_SECONDS);
     const futureItemsLimit = Math.max(1, WINDOW_ITEMS);
 
@@ -263,7 +298,7 @@ app.get("/channel.mpd", async (req, res) => {
     let futureItemsCount = 0;
 
     const specs = []; // { id, absStart, dur, mpdUrl }
-    const MAX_PASSES = 10000; // safety cap
+    const MAX_PASSES = 10000;
 
     walk: for (let pass = 0; pass < MAX_PASSES; pass++) {
       for (let i = 0; i < items.length; i++) {
@@ -298,13 +333,6 @@ app.get("/channel.mpd", async (req, res) => {
     if (!specs.length) {
       return res.status(500).send("No periods to publish");
     }
-
-    // 3) Fetch every distinct upstream MPD in parallel (via 10s cache).
-    const uniqueUrls = [...new Set(specs.map((s) => s.mpdUrl))];
-    const fetched = await Promise.all(
-      uniqueUrls.map(async (u) => [u, await fetchMpdParsed(u)])
-    );
-    const mpdByUrl = new Map(fetched);
 
     // 4) Build stitched MPD with stable AST anchored at CHANNEL_START_TIME.
     //    Use the first item's parsed MPD as the shell (gives us root attrs).
