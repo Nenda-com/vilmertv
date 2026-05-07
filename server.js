@@ -91,6 +91,20 @@ function baseUrlFromMpdUrl(mpdUrl) {
   }
 }
 
+// Normalize any valueless/boolean-ish XML attributes to valid XML values.
+// Example culprit: segmentAlignment (present but no value) => segmentAlignment="true"
+function normalizeXmlBooleanAttrs(node) {
+  if (!node || typeof node !== "object") return;
+
+  for (const [k, v] of Object.entries(node)) {
+    if (k.startsWith("@_") && (v === "" || v === true || v === null)) {
+      node[k] = "true";
+      continue;
+    }
+    if (typeof v === "object") normalizeXmlBooleanAttrs(v);
+  }
+}
+
 app.get("/channel.mpd", async (_req, res) => {
   try {
     // 1) Load playlist
@@ -144,8 +158,11 @@ app.get("/channel.mpd", async (_req, res) => {
       return res.status(500).send("Template MPD missing Period/AdaptationSet");
     }
 
-    // Normalize AdaptationSet to array to avoid malformed XML in some cases
+    // Normalize AdaptationSet to array
     if (!Array.isArray(adaptationSets)) adaptationSets = [adaptationSets];
+
+    // Fix invalid XML boolean attrs like segmentAlignment
+    for (const as of adaptationSets) normalizeXmlBooleanAttrs(as);
 
     // 4) Build stitched MPD
     const outMpd = deepClone(templateMpd);
