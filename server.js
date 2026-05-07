@@ -422,16 +422,25 @@ app.get("/channel.mpd", async (req, res) => {
           continue;
         }
 
-        if (absStart >= lookaheadEndAbs && emittedFuturePeriod) break walk;
-        if (absStart >= nowSec) emittedFuturePeriod = true;
+        // Stop once a period starts beyond the lookahead. Crucially we do NOT
+        // emit a partial future period — declaring 30 min of upcoming content
+        // makes Shaka treat the manifest's last-period-end as live edge and
+        // jump the playhead 30 min into the future.
+        if (absStart >= lookaheadEndAbs) break walk;
 
         const it = items[i];
         const mpdUrl = getItemUrl(it);
         if (mpdUrl) {
+          // If this period extends past the lookahead window, trim its
+          // declared @duration. The segments themselves are still available
+          // (SegmentTimeline isn't touched), but the player only sees the
+          // portion within the announced period. On the next manifest refresh,
+          // the truncated tail expands as wall-clock advances.
+          const effectiveDur = Math.min(dur, lookaheadEndAbs - absStart);
           specs.push({
             id: `${getItemId(it, i)}-${iteration}`,
             absStart,
-            dur,
+            dur: effectiveDur,
             mpdUrl,
           });
         }
