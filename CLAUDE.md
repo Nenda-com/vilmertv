@@ -160,6 +160,7 @@ The Zod-shaped error `{ path: ["parameters"], expected: "record" }` we hit durin
 | `LOOKAHEAD_SECONDS` | 30 | How far ahead to emit Periods |
 | `PLAYLIST_REFRESH_SECONDS` | 300 | How often to re-ingest sources |
 | `FAILURE_WEBHOOK_URL` | — | Optional POST target for failed-item reports |
+| `PROXY_SEGMENTS` | `true` | If `true`, manifest `BaseURL` is rewritten to `/p/<token>/` so segments flow through us (required for browsers / cross-origin embeds). Set to `false` for native clients (Android ExoPlayer, etc.) so segments fetch directly from upstream — removes us as a bandwidth bottleneck. Requires upstream session URLs to be **not IP-pinned to the manifest fetcher**. |
 
 ---
 

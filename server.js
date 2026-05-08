@@ -40,6 +40,9 @@ const PLAYLIST_REFRESH_SECONDS = Number(
 const FAILURE_WEBHOOK_URL = process.env.FAILURE_WEBHOOK_URL || null;
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || null;
 const MANIFEST_CACHE_TTL_MS = Number(process.env.MANIFEST_CACHE_TTL_MS || 1500);
+// PROXY_SEGMENTS=true  → BaseURL rewritten to /p/<token>/ (browsers / cross-origin embeds)
+// PROXY_SEGMENTS=false → BaseURL points straight at upstream (native players, no CORS)
+const PROXY_SEGMENTS = (process.env.PROXY_SEGMENTS ?? "true").toLowerCase() !== "false";
 
 if (!PLAYLIST_URL) {
   console.error("FATAL: PLAYLIST_URL is required");
@@ -277,7 +280,7 @@ async function getManifestXml(req) {
         suggestedDelaySec: SUGGESTED_DELAY_SECONDS,
       },
       utcTimingUrl: utcTimingUrlFor(req),
-      transformBaseUrl: proxyBaseUrlFn(proto, host),
+      transformBaseUrl: PROXY_SEGMENTS ? proxyBaseUrlFn(proto, host) : undefined,
       now: t,
     });
     manifestCache.set(key, { xml, at: Date.now() });
@@ -314,7 +317,8 @@ const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`CHANNEL_EPOCH=${CHANNEL_EPOCH}`);
   console.log(
     `refresh=${PLAYLIST_REFRESH_SECONDS}s lookahead=${LOOKAHEAD_SECONDS}s ` +
-      `timeshift=${TIME_SHIFT_SECONDS}s minUpdate=${MIN_UPDATE_PERIOD_SECONDS}s`
+      `timeshift=${TIME_SHIFT_SECONDS}s minUpdate=${MIN_UPDATE_PERIOD_SECONDS}s ` +
+      `proxySegments=${PROXY_SEGMENTS}`
   );
 });
 
