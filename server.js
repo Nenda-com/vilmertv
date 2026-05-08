@@ -1,12 +1,64 @@
+// vilmertv — DASH FAST channel server.
+//
+// Modules:
+//   scheduler.js   — pure: epoch-anchored playlist → Period descriptors
+//   sourceMpd.js   — fetch + parse one source MPD → ResolvedItem
+//   cache.js       — refresh loop + failure tracking
+//   mpd.js         — emit dynamic multi-period DASH XML
+//
+// This file:
+//   - Express wiring + CORS
+//   - HTTP keep-alive + retry-with-backoff (used by both ingestion and proxy)
+//   - Segment proxy at /p/<base64url(upstreamBase)>/<path> so playback works
+//     across origins without depending on upstream CORS
+//   - Manifest cache + single-in-flight build (herd dedup)
+
 import express from "express";
-import fetch from "node-fetch";
-import { XMLParser, XMLBuilder } from "fast-xml-parser";
+import nodeFetch from "node-fetch";
 import http from "http";
 import https from "https";
+import { SourceCache } from "./cache.js";
+import { windowPeriods } from "./scheduler.js";
+import { buildMpd } from "./mpd.js";
 
-// Keep-alive agents so the proxy reuses TCP/TLS connections to upstream hosts.
-// Without this, every segment fetch pays the TCP+TLS handshake — adds 100s of
-// ms per request and visibly stalls period transitions on Shaka.
+// --- env ---
+const PORT = Number(process.env.PORT || 8080);
+const PLAYLIST_URL = process.env.PLAYLIST_URL;
+const CHANNEL_EPOCH =
+  process.env.CHANNEL_EPOCH || process.env.CHANNEL_START_TIME;
+const MIN_UPDATE_PERIOD_SECONDS = Number(
+  process.env.MIN_UPDATE_PERIOD_SECONDS || 4
+);
+const TIME_SHIFT_SECONDS = Number(process.env.TIME_SHIFT_SECONDS || 30);
+const SUGGESTED_DELAY_SECONDS = Number(
+  process.env.SUGGESTED_DELAY_SECONDS || 12
+);
+const LOOKAHEAD_SECONDS = Number(process.env.LOOKAHEAD_SECONDS || 30);
+const PLAYLIST_REFRESH_SECONDS = Number(
+  process.env.PLAYLIST_REFRESH_SECONDS || 300
+);
+const FAILURE_WEBHOOK_URL = process.env.FAILURE_WEBHOOK_URL || null;
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || null;
+const MANIFEST_CACHE_TTL_MS = Number(process.env.MANIFEST_CACHE_TTL_MS || 1500);
+
+if (!PLAYLIST_URL) {
+  console.error("FATAL: PLAYLIST_URL is required");
+  process.exit(1);
+}
+if (!CHANNEL_EPOCH) {
+  console.error(
+    "FATAL: CHANNEL_EPOCH is required (ISO 8601 UTC, e.g. 2026-01-01T00:00:00Z)"
+  );
+  process.exit(1);
+}
+if (!Number.isFinite(new Date(CHANNEL_EPOCH).getTime())) {
+  console.error(`FATAL: CHANNEL_EPOCH is not a valid ISO 8601 instant: ${CHANNEL_EPOCH}`);
+  process.exit(1);
+}
+
+// --- HTTP client: keep-alive + retry ---
+// Keep-alive is non-optional for the segment proxy: every TLS handshake adds
+// ~100ms+ and visibly stalls Period transitions on Shaka.
 const httpAgent = new http.Agent({
   keepAlive: true,
   keepAliveMsecs: 30_000,
@@ -17,110 +69,8 @@ const httpsAgent = new https.Agent({
   keepAliveMsecs: 30_000,
   maxSockets: 64,
 });
-const pickAgent = (url) =>
-  url.startsWith("https:") ? httpsAgent : httpAgent;
+const pickAgent = (url) => (url.startsWith("https:") ? httpsAgent : httpAgent);
 
-const app = express();
-const PORT = process.env.PORT || 8080;
-
-// Playlist JSON URL (set via OSC parameter store)
-const PLAYLIST_URL =
-  process.env.PLAYLIST_URL || "https://static.nenda.com/misc/vilmer_tv.json";
-
-// Fallback if an item does not include durationSeconds
-const DEFAULT_ITEM_DURATION_SECONDS = Number(
-  process.env.DEFAULT_ITEM_DURATION_SECONDS || 1800
-);
-
-// How many seconds of future content to expose as Periods in the MPD at any
-// time. Item count is a bad cap because a single 5h VOD blows the lookahead
-// way past wall-clock, letting the player jump to a future live edge that
-// doesn't exist yet.
-const LOOKAHEAD_SECONDS = Number(process.env.LOOKAHEAD_SECONDS || 120);
-
-// Live tune-in config
-// CHANNEL_START_TIME is the fixed AST anchor for the channel's presentation
-// timeline. Pin it once and never change it — changing it resets the timeline.
-const CHANNEL_START_TIME =
-  process.env.CHANNEL_START_TIME || "2026-05-07T10:00:00+02:00";
-const DVR_WINDOW_SECONDS = Number(process.env.DVR_WINDOW_SECONDS || 3600);
-const SUGGESTED_DELAY_SECONDS = Number(
-  process.env.SUGGESTED_DELAY_SECONDS || 30
-);
-
-const xmlParser = new XMLParser({
-  ignoreAttributes: false,
-  attributeNamePrefix: "@_",
-});
-
-const xmlBuilder = new XMLBuilder({
-  ignoreAttributes: false,
-  attributeNamePrefix: "@_",
-  format: true,
-  suppressBooleanAttributes: false,
-});
-
-// --- CORS + Range support (needed for Shaka / browser playback) ---
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Origin, Range, Accept, Content-Type"
-  );
-  res.setHeader(
-    "Access-Control-Expose-Headers",
-    "Content-Length, Content-Range, Accept-Ranges, ETag"
-  );
-  res.setHeader("Accept-Ranges", "bytes");
-
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
-
-// Basic request logging
-app.use((req, _res, next) => {
-  console.log(`${new Date().toISOString()} ${req.method} ${req.url}`);
-  next();
-});
-
-app.get("/healthz", (_req, res) => res.status(200).send("ok"));
-
-function deepClone(obj) {
-  return JSON.parse(JSON.stringify(obj));
-}
-
-function pickItems(playlistJson) {
-  if (Array.isArray(playlistJson?.items)) return playlistJson.items;
-  if (Array.isArray(playlistJson?.programs)) return playlistJson.programs;
-  if (Array.isArray(playlistJson)) return playlistJson;
-  return [];
-}
-
-function getItemUrl(item) {
-  return item?.asset?.url || item?.url || item?.mpdUrl;
-}
-
-function getItemId(item, idx) {
-  return item?.id || item?.assetId || `vod-${idx}`;
-}
-
-function getItemDurationSeconds(item) {
-  const d = Number(item?.durationSeconds);
-  return Number.isFinite(d) && d > 0 ? d : DEFAULT_ITEM_DURATION_SECONDS;
-}
-
-function baseUrlFromMpdUrl(mpdUrl) {
-  const u = new URL(mpdUrl);
-  u.hash = "";
-  u.search = "";
-  u.pathname = u.pathname.replace(/[^/]*$/, "");
-  return u.toString();
-}
-
-// Fetch with per-attempt timeout + retry on 5xx / network errors. A slow or
-// briefly-unavailable upstream shouldn't take down a request — Shaka's retry
-// budget is limited and a single failed fetch can stall playback.
 async function fetchWithRetry(url, fetchOpts = {}, retryOpts = {}) {
   const {
     timeoutMs = 15_000,
@@ -132,7 +82,7 @@ async function fetchWithRetry(url, fetchOpts = {}, retryOpts = {}) {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), timeoutMs);
     try {
-      const resp = await fetch(url, {
+      const resp = await nodeFetch(url, {
         redirect: "follow",
         agent: pickAgent(url),
         ...fetchOpts,
@@ -160,193 +110,63 @@ async function fetchWithRetry(url, fetchOpts = {}, retryOpts = {}) {
   throw lastErr;
 }
 
-// Cache parsed upstream MPDs so /channel.mpd doesn't refetch every request.
-const MPD_CACHE_TTL_MS = 60_000;
-const mpdCache = new Map(); // mpdUrl -> { parsed, fetchedAt }
+// --- cache ---
+const cache = new SourceCache({
+  playlistUrl: PLAYLIST_URL,
+  refreshIntervalMs: PLAYLIST_REFRESH_SECONDS * 1000,
+  failureWebhookUrl: FAILURE_WEBHOOK_URL,
+  fetchImpl: fetchWithRetry,
+});
 
-async function fetchMpdParsed(mpdUrl) {
-  const now = Date.now();
-  const cached = mpdCache.get(mpdUrl);
-  if (cached && now - cached.fetchedAt < MPD_CACHE_TTL_MS) return cached.parsed;
-  const resp = await fetchWithRetry(mpdUrl, { method: "GET" });
-  if (!resp.ok) {
-    throw new Error(`Failed to fetch upstream MPD ${mpdUrl}: ${resp.status}`);
-  }
-  const text = await resp.text();
-  const parsedRaw = xmlParser.parse(text);
-  const parsed = parsedRaw?.MPD ? parsedRaw : { MPD: parsedRaw };
-  mpdCache.set(mpdUrl, { parsed, fetchedAt: now });
-  return parsed;
-}
+// --- express ---
+const app = express();
+app.set("trust proxy", true);
 
-function isImageAdaptationSet(as) {
-  const ct = as?.["@_contentType"];
-  const mt = as?.["@_mimeType"];
-  return ct === "image" || (typeof mt === "string" && mt.startsWith("image/"));
-}
-
-function adaptationSetsFromParsed(parsed) {
-  const period = Array.isArray(parsed.MPD?.Period)
-    ? parsed.MPD.Period[0]
-    : parsed.MPD?.Period;
-  let as = period?.AdaptationSet;
-  if (!as) return null;
-  if (!Array.isArray(as)) as = [as];
-  // Drop thumbnail/image tracks — upstream 404s on them and Shaka complains.
-  as = as.filter((a) => !isImageAdaptationSet(a));
-  return as.length ? as : null;
-}
-
-function parseIso8601DurationToSeconds(s) {
-  if (!s) return null;
-  const m = /^PT(?:([\d.]+)H)?(?:([\d.]+)M)?(?:([\d.]+)S)?$/.exec(s);
-  if (!m) return null;
-  const h = parseFloat(m[1] || 0);
-  const min = parseFloat(m[2] || 0);
-  const sec = parseFloat(m[3] || 0);
-  const total = h * 3600 + min * 60 + sec;
-  return Number.isFinite(total) && total > 0 ? total : null;
-}
-
-// Return a deep-cloned AdaptationSet whose SegmentTimeline is truncated so it
-// covers at most `maxSeconds` of period-relative time. Shaka treats the upstream
-// SegmentTimeline as authoritative for live-edge calculation, so trimming only
-// Period@duration isn't enough — the SegmentTimeline must be trimmed too,
-// otherwise the player picks the original clip end as live edge and parks the
-// playhead in the (still-non-existent) future.
-function trimAdaptationSetTimeline(as, maxSeconds) {
-  const cloned = deepClone(as);
-  const st = cloned?.SegmentTemplate;
-  if (!st) return cloned;
-  const ts = parseInt(st["@_timescale"] || "1", 10);
-  if (!Number.isFinite(ts) || ts <= 0) return cloned;
-  const tl = st.SegmentTimeline;
-  if (!tl) return cloned;
-  let sList = tl.S;
-  if (!sList) return cloned;
-  if (!Array.isArray(sList)) sList = [sList];
-
-  const maxTicks = Math.floor(maxSeconds * ts);
-  if (maxTicks <= 0) {
-    st.SegmentTimeline.S = [];
-    return cloned;
-  }
-
-  let runningT = 0;
-  const newS = [];
-  for (const s of sList) {
-    const tAttr = s?.["@_t"];
-    const t = tAttr !== undefined ? parseInt(tAttr, 10) : runningT;
-    const d = parseInt(s?.["@_d"], 10);
-    const r = parseInt(s?.["@_r"] || "0", 10);
-    if (!Number.isFinite(d) || d <= 0) continue;
-    const count = Number.isFinite(r) && r >= 0 ? r + 1 : 1;
-    const fullEnd = t + d * count;
-
-    if (t >= maxTicks) break;
-
-    if (fullEnd <= maxTicks) {
-      newS.push(s);
-      runningT = fullEnd;
-    } else {
-      const keepCount = Math.floor((maxTicks - t) / d);
-      if (keepCount > 0) {
-        const partial = { ...s };
-        if (keepCount === 1) delete partial["@_r"];
-        else partial["@_r"] = String(keepCount - 1);
-        newS.push(partial);
-        runningT = t + d * keepCount;
-      }
-      break;
-    }
-  }
-  st.SegmentTimeline.S = newS;
-  return cloned;
-}
-
-function adaptationSetTotalSeconds(as) {
-  const st = as?.SegmentTemplate;
-  if (!st) return null;
-  const ts = parseInt(st["@_timescale"] || "1", 10);
-  if (!Number.isFinite(ts) || ts <= 0) return null;
-  const tl = st.SegmentTimeline;
-  if (!tl) return null;
-  let sList = tl.S;
-  if (!sList) return null;
-  if (!Array.isArray(sList)) sList = [sList];
-  let totalTicks = 0;
-  for (const s of sList) {
-    const d = parseInt(s?.["@_d"], 10);
-    const r = parseInt(s?.["@_r"] || "0", 10);
-    if (Number.isFinite(d) && d > 0) {
-      totalTicks += d * (Number.isFinite(r) ? r + 1 : 1);
-    }
-  }
-  return totalTicks > 0 ? totalTicks / ts : null;
-}
-
-// Use the MINIMUM of all AdaptationSet timeline lengths in the upstream MPD.
-// mediaPresentationDuration is typically the MAX (longest track), which leaves
-// shorter tracks under-covered at the period boundary — Safari MSE silently
-// stalls when audio outruns video by even a few milliseconds.
-function upstreamDurationSeconds(parsed) {
-  const adaptationSets = adaptationSetsFromParsed(parsed);
-  if (adaptationSets) {
-    let minDur = Infinity;
-    for (const as of adaptationSets) {
-      const d = adaptationSetTotalSeconds(as);
-      if (d && d < minDur) minDur = d;
-    }
-    if (Number.isFinite(minDur) && minDur > 0) return minDur;
-  }
-  // Fallbacks (less accurate, in this order):
-  const fromMpd = parseIso8601DurationToSeconds(
-    parsed.MPD?.["@_mediaPresentationDuration"]
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Origin, Range, Accept, Content-Type"
   );
-  if (fromMpd) return fromMpd;
-  const period = Array.isArray(parsed.MPD?.Period)
-    ? parsed.MPD.Period[0]
-    : parsed.MPD?.Period;
-  return parseIso8601DurationToSeconds(period?.["@_duration"]);
-}
+  res.setHeader(
+    "Access-Control-Expose-Headers",
+    "Content-Length, Content-Range, Accept-Ranges, ETag"
+  );
+  res.setHeader("Accept-Ranges", "bytes");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
 
-function sanitizeDashXmlBooleans(node) {
-  if (!node || typeof node !== "object") return;
+app.use((req, _res, next) => {
+  console.log(`${new Date().toISOString()} ${req.method} ${req.url}`);
+  next();
+});
 
-  const booleanAttrs = new Set([
-    "segmentAlignment",
-    "subsegmentAlignment",
-    "bitstreamSwitching",
-  ]);
+app.get("/healthz", (_req, res) => res.status(200).send("ok"));
 
-  for (const k of Object.keys(node)) {
-    const v = node[k];
+// UTCTiming source — clients use this to align their clocks to ours so they
+// converge on the same Period at the same wall time.
+app.get("/time", (_req, res) => {
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  res.status(200).send(new Date().toISOString());
+});
 
-    if (booleanAttrs.has(k) && (v === "" || v === true || v === null)) {
-      node[`@_${k}`] = "true";
-      delete node[k];
-      continue;
-    }
+app.get("/health/sources", (_req, res) => {
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
+  res.status(200).json(cache.health());
+});
 
-    if (k.startsWith("@_") && (v === "" || v === true || v === null)) {
-      node[k] = "true";
-      continue;
-    }
-
-    if (typeof v === "object") sanitizeDashXmlBooleans(v);
-  }
-}
-/**
- * GET /p/:token/<path>
- *
- * :token is base64url(upstreamBaseUrl) — URL-path-safe alphabet, no encoding needed.
- * <path> is appended by the DASH client (e.g. video_x/init.cmfv)
- */
+// --- segment proxy ---
+// Tokens are base64url-encoded so they're URL-path-safe with no further
+// encoding. We pass through Range/Content-Range/ETag for byte-range playback.
 app.get("/p/:token/*", async (req, res) => {
   try {
-    const token = req.params.token; // base64url string (no / + =)
-    const upstreamBase = Buffer.from(token, "base64url").toString("utf8");
-
+    const upstreamBase = Buffer.from(req.params.token, "base64url").toString(
+      "utf8"
+    );
     if (!/^https?:\/\//i.test(upstreamBase)) {
       return res.status(400).send("Invalid upstream base");
     }
@@ -357,23 +177,17 @@ app.get("/p/:token/*", async (req, res) => {
     const suffix = req.params[0] || "";
     const upstreamUrl = upstreamBase + suffix;
 
-    const headers = {
-      "user-agent": "osc-vod2live-proxy/3.0",
-      accept: "*/*",
-    };
-    if (req.headers.range) headers["range"] = req.headers.range;
+    const headers = { "user-agent": "vilmertv/0.2", accept: "*/*" };
+    if (req.headers.range) headers.range = req.headers.range;
 
     const upstreamResp = await fetchWithRetry(
       upstreamUrl,
       { method: "GET", headers },
-      // Segment fetches: a bit more aggressive than MPDs since Shaka retries
-      // are themselves expensive (manifest reparse, buffer reset).
       { timeoutMs: 20_000, maxAttempts: 3, backoffMs: 300 }
     );
 
     res.status(upstreamResp.status);
-
-    const passthrough = [
+    for (const h of [
       "content-type",
       "content-length",
       "content-range",
@@ -381,13 +195,10 @@ app.get("/p/:token/*", async (req, res) => {
       "etag",
       "cache-control",
       "last-modified",
-    ];
-    for (const h of passthrough) {
+    ]) {
       const v = upstreamResp.headers.get(h);
       if (v) res.setHeader(h, v);
     }
-
-    // Ensure CORS + expose range headers
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader(
       "Access-Control-Expose-Headers",
@@ -398,264 +209,120 @@ app.get("/p/:token/*", async (req, res) => {
     if (!upstreamResp.body) return res.end();
     upstreamResp.body.pipe(res);
   } catch (e) {
-    console.error(e);
+    console.error("[/p]", e);
     res.status(502).send(`Proxy error: ${e?.message || e}`);
   }
 });
-// Cache the generated manifest XML for a short TTL so a herd of clients all
-// refreshing every ~5s share one round of work. Single in-flight build is
-// shared via a promise, so concurrent cache misses don't all rebuild.
-const MANIFEST_CACHE_TTL_MS = 1500;
-let manifestCache = { xml: null, host: null, generatedAt: 0 };
-let manifestInFlight = null;
+
+// --- manifest ---
+function publicSchemeAndHost(req) {
+  const proto = req.headers["x-forwarded-proto"] || req.protocol;
+  const host = req.headers["x-forwarded-host"] || req.headers.host;
+  return { proto, host };
+}
+
+function utcTimingUrlFor(req) {
+  if (PUBLIC_BASE_URL) return `${PUBLIC_BASE_URL.replace(/\/$/, "")}/time`;
+  const { proto, host } = publicSchemeAndHost(req);
+  return `${proto}://${host}/time`;
+}
+
+function proxyBaseUrlFn(proto, host) {
+  return (upstreamBase) => {
+    const token = Buffer.from(upstreamBase, "utf8").toString("base64url");
+    return `${proto}://${host}/p/${token}/`;
+  };
+}
+
+// Per-host cache + single-in-flight build to keep a herd of refreshing clients
+// from each rebuilding the same MPD.
+const manifestCache = new Map(); // key: `${proto}://${host}` -> { xml, at }
+const manifestInflight = new Map(); // key -> Promise<xml>
+
+async function getManifestXml(req) {
+  const { proto, host } = publicSchemeAndHost(req);
+  const key = `${proto}://${host}`;
+  const now = Date.now();
+  const cached = manifestCache.get(key);
+  if (cached && now - cached.at < MANIFEST_CACHE_TTL_MS) return cached.xml;
+  const inflight = manifestInflight.get(key);
+  if (inflight) return inflight;
+
+  const promise = (async () => {
+    const items = cache.getActiveItems();
+    if (items.length === 0) {
+      const e = new Error(
+        "Channel cache is empty (no resolved sources yet). Try again shortly."
+      );
+      e.status = 503;
+      throw e;
+    }
+    const t = new Date();
+    const periods = windowPeriods(CHANNEL_EPOCH, items, t, {
+      lookbehindSec: TIME_SHIFT_SECONDS,
+      lookaheadSec: LOOKAHEAD_SECONDS,
+    });
+    if (periods.length === 0) {
+      const e = new Error("Channel has not started yet.");
+      e.status = 503;
+      throw e;
+    }
+    const xml = buildMpd({
+      epoch: CHANNEL_EPOCH,
+      periods,
+      cache,
+      settings: {
+        minUpdatePeriodSec: MIN_UPDATE_PERIOD_SECONDS,
+        timeShiftSec: TIME_SHIFT_SECONDS,
+        suggestedDelaySec: SUGGESTED_DELAY_SECONDS,
+      },
+      utcTimingUrl: utcTimingUrlFor(req),
+      transformBaseUrl: proxyBaseUrlFn(proto, host),
+      now: t,
+    });
+    manifestCache.set(key, { xml, at: Date.now() });
+    return xml;
+  })().finally(() => {
+    manifestInflight.delete(key);
+  });
+  manifestInflight.set(key, promise);
+  return promise;
+}
 
 app.get("/channel.mpd", async (req, res) => {
   try {
-    const host = req.get("host");
-    const now = Date.now();
-    if (
-      manifestCache.xml &&
-      manifestCache.host === host &&
-      now - manifestCache.generatedAt < MANIFEST_CACHE_TTL_MS
-    ) {
-      res.set("Content-Type", "application/dash+xml; charset=utf-8");
-      return res.status(200).send(manifestCache.xml);
-    }
-    if (manifestInFlight) {
-      const xml = await manifestInFlight;
-      res.set("Content-Type", "application/dash+xml; charset=utf-8");
-      return res.status(200).send(xml);
-    }
-    manifestInFlight = (async () => {
-      try {
-        const xml = await buildChannelManifest(host);
-        manifestCache = { xml, host, generatedAt: Date.now() };
-        return xml;
-      } finally {
-        manifestInFlight = null;
-      }
-    })();
-    const xml = await manifestInFlight;
-    res.set("Content-Type", "application/dash+xml; charset=utf-8");
-    return res.status(200).send(xml);
-  } catch (e) {
-    console.error(e);
-    return res.status(500).send(`Error generating MPD: ${e?.message || e}`);
-  }
-});
-
-async function buildChannelManifest(host) {
-  // Throws on error; caller maps to 500.
-  const req = { get: (k) => (k === "host" ? host : undefined) };
-  const res = {
-    _status: 200,
-    _body: null,
-    _ct: null,
-    status(c) { this._status = c; return this; },
-    send(b) { this._body = b; return this; },
-    set(k, v) { if (k.toLowerCase() === "content-type") this._ct = v; return this; },
-  };
-  await _channelMpdHandler(req, res);
-  if (res._status !== 200) {
-    throw new Error(`build failed: HTTP ${res._status} ${res._body}`);
-  }
-  return res._body;
-}
-
-async function _channelMpdHandler(req, res) {
-  try {
-    if (!CHANNEL_START_TIME) {
-      return res.status(500).send("Missing env CHANNEL_START_TIME");
-    }
-    const channelStartMs = Date.parse(CHANNEL_START_TIME);
-    if (Number.isNaN(channelStartMs)) {
-      return res
-        .status(500)
-        .send("Invalid env CHANNEL_START_TIME (must be ISO8601)");
-    }
-
-    // 1) Load playlist
-    const playlistResp = await fetch(PLAYLIST_URL, { redirect: "follow" });
-    if (!playlistResp.ok) {
-      return res
-        .status(502)
-        .send(`Failed to fetch playlist: ${playlistResp.status}`);
-    }
-    const playlistJson = await playlistResp.json();
-    const items = pickItems(playlistJson);
-
-    if (!items.length) return res.status(400).send("Playlist has no items");
-
-    // 2) Fetch every item's upstream MPD in parallel (60s cache) so we can
-    //    use each VOD's true media duration — playlist durationSeconds is
-    //    integer-rounded and causes sub-frame gaps at period boundaries.
-    const allItemUrls = items.map(getItemUrl);
-    const fetched = await Promise.all(
-      allItemUrls.map(async (u) => (u ? [u, await fetchMpdParsed(u)] : null))
-    );
-    const mpdByUrl = new Map(fetched.filter(Boolean));
-
-    // Real per-item durations (fall back to playlist durationSeconds).
-    const durationsSec = items.map((it) => {
-      const u = getItemUrl(it);
-      const parsed = u ? mpdByUrl.get(u) : null;
-      const real = parsed ? upstreamDurationSeconds(parsed) : null;
-      return real && real > 0 ? real : getItemDurationSeconds(it);
-    });
-    const loopDurationSec = durationsSec.reduce((a, b) => a + b, 0);
-    if (loopDurationSec <= 0) {
-      return res.status(400).send("Playlist has zero total duration");
-    }
-
-    const nowSec = (Date.now() - channelStartMs) / 1000;
-    if (nowSec < 0) {
-      return res.status(425).send("Channel has not started yet");
-    }
-
-    // 3) Walk the loop and collect period specs overlapping the DVR window
-    //    plus up to WINDOW_ITEMS upcoming items.
-    const windowStartAbs = Math.max(0, nowSec - DVR_WINDOW_SECONDS);
-    // Stop emitting once the next period would START past now + lookahead.
-    // We always emit at least one period whose @start >= nowSec so the player
-    // has something to chain into, even if a single item is longer than the
-    // lookahead window.
-    const lookaheadEndAbs = nowSec + LOOKAHEAD_SECONDS;
-
-    let iteration = Math.floor(windowStartAbs / loopDurationSec);
-    let absStart = iteration * loopDurationSec;
-    let emittedFuturePeriod = false;
-
-    const specs = []; // { id, absStart, dur, mpdUrl }
-    const MAX_PASSES = 10000;
-
-    walk: for (let pass = 0; pass < MAX_PASSES; pass++) {
-      for (let i = 0; i < items.length; i++) {
-        const dur = durationsSec[i];
-        const absEnd = absStart + dur;
-
-        if (absEnd <= windowStartAbs) {
-          absStart = absEnd;
-          continue;
-        }
-
-        // Stop once a period starts beyond the lookahead. Crucially we do NOT
-        // emit a partial future period — declaring 30 min of upcoming content
-        // makes Shaka treat the manifest's last-period-end as live edge and
-        // jump the playhead 30 min into the future.
-        if (absStart >= lookaheadEndAbs) break walk;
-
-        const it = items[i];
-        const mpdUrl = getItemUrl(it);
-        if (mpdUrl) {
-          // If this period extends past the lookahead window, trim its
-          // declared @duration. The segments themselves are still available
-          // (SegmentTimeline isn't touched), but the player only sees the
-          // portion within the announced period. On the next manifest refresh,
-          // the truncated tail expands as wall-clock advances.
-          const effectiveDur = Math.min(dur, lookaheadEndAbs - absStart);
-          specs.push({
-            id: `${getItemId(it, i)}-${iteration}`,
-            absStart,
-            dur: effectiveDur,
-            mpdUrl,
-          });
-        }
-        absStart = absEnd;
-      }
-      iteration++;
-    }
-
-    if (!specs.length) {
-      return res.status(500).send("No periods to publish");
-    }
-
-    // 4) Build stitched MPD with stable AST anchored at CHANNEL_START_TIME.
-    //    Use the first item's parsed MPD as the shell (gives us root attrs).
-    const outMpd = deepClone(mpdByUrl.get(specs[0].mpdUrl));
-
-    outMpd.MPD["@_type"] = "dynamic";
-    outMpd.MPD["@_availabilityStartTime"] = new Date(
-      channelStartMs
-    ).toISOString();
-    outMpd.MPD["@_minimumUpdatePeriod"] = "PT5S";
-    outMpd.MPD["@_timeShiftBufferDepth"] = `PT${DVR_WINDOW_SECONDS}S`;
-    outMpd.MPD["@_suggestedPresentationDelay"] = `PT${SUGGESTED_DELAY_SECONDS}S`;
-
-    delete outMpd.MPD["@_mediaPresentationDuration"];
-
-    // Assign a stable AdaptationSet @id per canonical rendition (contentType +
-    // mimeType + resolution + lang + trick-play flag) and tag each set with
-    // urn:mpeg:dash:period-continuity:2015 so Shaka can chain the same logical
-    // rendition across periods. Without this, two periods both labelling their
-    // 720p set as id="1" while another period labels id="1" as 540p breaks the
-    // boundary transition.
-    const stableAsIds = new Map();
-    let nextStableId = 1;
-    const getStableAsId = (as) => {
-      const key = [
-        as["@_contentType"] || "",
-        as["@_mimeType"] || "",
-        `${as["@_maxWidth"] || ""}x${as["@_maxHeight"] || ""}`,
-        as["@_lang"] || "",
-        as["@_codingDependency"] === "false" ? "trick" : "main",
-      ].join("|");
-      let id = stableAsIds.get(key);
-      if (id === undefined) {
-        id = nextStableId++;
-        stableAsIds.set(key, id);
-      }
-      return id;
-    };
-    const periods = [];
-    for (const spec of specs) {
-      const itemMpd = mpdByUrl.get(spec.mpdUrl);
-      const itemAdaptationSets = adaptationSetsFromParsed(itemMpd);
-      if (!itemAdaptationSets) continue;
-
-      const upstreamBase = baseUrlFromMpdUrl(spec.mpdUrl);
-      const token = Buffer.from(upstreamBase, "utf8").toString("base64url");
-      const proxiedBase = `https://${req.get("host")}/p/${token}/`;
-
-      // Stable AS @id by canonical content lets Shaka match the same logical
-      // rendition across periods. Default multi-period transitions (no
-      // continuity/connectivity hint) reset the SourceBuffer and timestampOffset
-      // per period — which is what we need for VODs from different encoder
-      // sessions with slightly different SPS/PPS.
-      const adaptationSetsForPeriod = itemAdaptationSets.map((as) => {
-        const trimmed = trimAdaptationSetTimeline(as, spec.dur);
-        const stableId = getStableAsId(trimmed);
-        trimmed["@_id"] = String(stableId);
-        return trimmed;
-      });
-
-      periods.push({
-        "@_id": spec.id,
-        "@_start": `PT${spec.absStart}S`,
-        "@_duration": `PT${spec.dur}S`,
-        BaseURL: proxiedBase,
-        AdaptationSet: adaptationSetsForPeriod,
-      });
-    }
-
-    outMpd.MPD.Period = periods;
-
-    sanitizeDashXmlBooleans(outMpd);
-
-    const xml = xmlBuilder.build(outMpd);
-
-    res.set("Content-Type", "application/dash+xml; charset=utf-8");
+    const xml = await getManifestXml(req);
+    res.setHeader("Content-Type", "application/dash+xml; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store, max-age=0");
     res.status(200).send(xml);
   } catch (e) {
-    console.error(e);
+    if (e?.status === 503) {
+      res.setHeader("Retry-After", "5");
+      return res.status(503).send(e.message);
+    }
+    console.error("[/channel.mpd]", e);
     res.status(500).send(`Error generating MPD: ${e?.message || e}`);
   }
-}
-app.listen(PORT, "0.0.0.0", () => {
+});
+
+// --- boot ---
+await cache.start();
+
+const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`vilmertv listening on 0.0.0.0:${PORT}`);
   console.log(`PLAYLIST_URL=${PLAYLIST_URL}`);
-  console.log(`LOOKAHEAD_SECONDS=${LOOKAHEAD_SECONDS}`);
-  console.log(`DEFAULT_ITEM_DURATION_SECONDS=${DEFAULT_ITEM_DURATION_SECONDS}`);
-  console.log(`CHANNEL_START_TIME=${CHANNEL_START_TIME}`);
-  console.log(`DVR_WINDOW_SECONDS=${DVR_WINDOW_SECONDS}`);
-  console.log(`SUGGESTED_DELAY_SECONDS=${SUGGESTED_DELAY_SECONDS}`);
+  console.log(`CHANNEL_EPOCH=${CHANNEL_EPOCH}`);
+  console.log(
+    `refresh=${PLAYLIST_REFRESH_SECONDS}s lookahead=${LOOKAHEAD_SECONDS}s ` +
+      `timeshift=${TIME_SHIFT_SECONDS}s minUpdate=${MIN_UPDATE_PERIOD_SECONDS}s`
+  );
 });
+
+function shutdown(sig) {
+  console.log(`[${sig}] shutting down`);
+  cache.stop();
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 5000).unref();
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
