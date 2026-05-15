@@ -196,12 +196,14 @@ app.get("/p/:token/*", async (req, res) => {
       "content-range",
       "accept-ranges",
       "etag",
-      "cache-control",
       "last-modified",
     ]) {
       const v = upstreamResp.headers.get(h);
       if (v) res.setHeader(h, v);
     }
+    // Segments are immutable per URL — safe to cache aggressively at the edge.
+    // Overrides whatever upstream sent (which is often no-cache).
+    res.setHeader("Cache-Control", "public, max-age=86400, immutable");
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader(
       "Access-Control-Expose-Headers",
@@ -296,7 +298,9 @@ app.get("/channel.mpd", async (req, res) => {
   try {
     const xml = await getManifestXml(req);
     res.setHeader("Content-Type", "application/dash+xml; charset=utf-8");
-    res.setHeader("Cache-Control", "no-store, max-age=0");
+    // Short edge cache so a herd of clients refreshing on minimumUpdatePeriod
+    // (PT4S) collapses to ~1 origin hit per edge POP per window.
+    res.setHeader("Cache-Control", "public, max-age=2");
     res.status(200).send(xml);
   } catch (e) {
     if (e?.status === 503) {
